@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         建行专题班学习辅助
 // @namespace    local.ccb.course-helper
-// @version      1.4.2
+// @version      1.4.3
 // @description  识别未完成课程，辅助进入课程并按设置播放；只读取平台真实进度，不模拟完成。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -24,7 +24,6 @@
   const POOL_KEY = 'ccbMultiPoolV1';
   const CURRENT_TASK_KEY = 'ccbCurrentTask';
   const TAB_ID_KEY = 'ccbMultiTabId';
-  const RESUME_KEY = 'ccbAutoResume';
 
   const MAX_REPLAY = 3;
   const PROGRESS_WAIT_MS = 3500;
@@ -32,11 +31,13 @@
   const CLAIM_TTL = 30 * 60 * 1000;
   const PAGE_LOAD_COOLDOWN = 2000;
   const CLICK_COOLDOWN = 1500;
-  const DETAIL_SETTLE_MS = 2500;   // 课程详情页稳定时间
+  const DETAIL_SETTLE_MS = 2500;
+  const AUTO_CONTINUE_COOLDOWN = 10000; // 自动续刷冷却 10 秒
+  const CHILD_CLOSE_DELAY = 2000;       // 子页完成提示停留时间
 
   const defaults = {
     autoOpen: true, autoplay: true, muted: true, minimized: false,
-    force3x: false, auto2x: false, multiCount: 2,
+    force3x: false, auto2x: false, multiCount: 2, autoContinue: true,
     panelX: null, panelY: null,
   };
   const settings = {
@@ -54,14 +55,18 @@
   let lastAutoActionTime = 0;
   let multiRunning = false;
 
+  /* 列表页自动续刷状态 */
+  let childWindows = [];
+  let autoContinueEnabled = false;
+  let lastRunMultiTime = 0;
+
   /* ==================== 身份识别 ==================== */
   let _multiChildCache = null;
   function isMultiChild() {
     if (_multiChildCache !== null) return _multiChildCache;
-    const hash = location.hash;
-    const q = hash.indexOf('?');
+    const q = location.hash.indexOf('?');
     if (q >= 0) {
-      const params = new URLSearchParams(hash.slice(q + 1));
+      const params = new URLSearchParams(location.hash.slice(q + 1));
       if (params.has('ccbMulti')) {
         try { sessionStorage.setItem(MULTI_TAB_KEY, '1'); } catch (_) {}
         _multiChildCache = true; return true;
@@ -75,6 +80,12 @@
       if (sessionStorage.getItem(MULTI_TAB_KEY) === '1') { _multiChildCache = true; return true; }
     } catch (_) {}
     _multiChildCache = false; return false;
+  }
+
+  function isAutoOpenedDetailPage() {
+    const q = location.hash.indexOf('?');
+    if (q < 0) return false;
+    return new URLSearchParams(location.hash.slice(q + 1)).has('ccbAuto');
   }
 
   let multiParent = (() => {
@@ -107,12 +118,27 @@
   const textOf = el => norm(el?.innerText || el?.textContent || '');
   const progressRe = /(\d{1,3}(?:\.\d+)?)\s*%/;
   const fmtProgress = p => (p === null || p === undefined ? '未识别' : `${p}%`);
+  const isWindowAlive = (w) => { try { return !!w && !w.closed; } catch (_) { return false; } };
 
   let saveTimer = null;
   const scheduleSave = () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { save(); saveTimer = null; }, 300);
   };
+
+  function closeSelf(reason) {
+    const status = panel.querySelector('.status');
+    if (status) status.textContent = reason || '任务已完成，本页即将关闭…';
+    setTimeout(() => {
+      try { window.open('', '_self'); window.close(); } catch (_) {}
+      setTimeout(() => {
+        try { window.close(); } catch (_) {}
+        setTimeout(() => {
+          try { location.replace('about:blank'); } catch (_) {}
+        }, 500);
+      }, 500);
+    }, CHILD_CLOSE_DELAY);
+  }
 
   /* ==================== 页面识别 ==================== */
   const isVideoPage = () => /^#\/play\/[^?]+/.test(location.hash) || !!document.querySelector('.player_area video');
@@ -126,10 +152,8 @@
     let scope;
     if (root === document) {
       if (document.querySelector('.player_area')) scope = document.querySelector('.player_area');
-      else if (detail) {
-        scope = document.querySelector('.progress-v');
-        if (!scope) return null;
-      } else scope = document;
+      else if (detail) { scope = document.querySelector('.progress-v'); if (!scope) return null; }
+      else scope = document;
     } else scope = root;
     if (!scope) return null;
 
@@ -190,7 +214,6 @@
       .find(el => visible(el) && textOf(el).includes(label));
   }
 
-  /* 专门的“继续学习”按钮查找（覆盖多种 DOM 结构） */
   function findContinueButton() {
     for (const sel of ['button.to-learn', '.to-learn', '[class*="to-learn"]']) {
       const els = [...document.querySelectorAll(sel)].filter(visible);
@@ -247,6 +270,9 @@
       if (target && isMultiChild()) {
         const sep = target.includes('?') ? '&' : '?';
         target = `${target}${sep}ccbMulti=1`;
+      } else if (target && isAutoOpenedDetailPage()) {
+        const sep = target.includes('?') ? '&' : '?';
+        target = `${target}${sep}ccbAuto=1`;
       }
     }
     if (target && target !== location.href) {
@@ -341,10 +367,7 @@
     const pool = all[poolId];
     if (!pool) return;
     const task = pool.tasks.find(t => t.id === taskId);
-    if (task) {
-      task.done = true; task.claimedBy = null; task.claimTime = null;
-      writePools(all);
-    }
+    if (task) { task.done = true; task.claimedBy = null; task.claimTime = null; writePools(all); }
   }
 
   const readCurrentTask = () => {
@@ -352,10 +375,8 @@
     catch (_) { return null; }
   };
   const writeCurrentTask = (v) => {
-    try {
-      if (v) sessionStorage.setItem(CURRENT_TASK_KEY, JSON.stringify(v));
-      else sessionStorage.removeItem(CURRENT_TASK_KEY);
-    } catch (_) {}
+    try { v ? sessionStorage.setItem(CURRENT_TASK_KEY, JSON.stringify(v)) : sessionStorage.removeItem(CURRENT_TASK_KEY); }
+    catch (_) {}
   };
 
   function getPoolProgress(poolId) {
@@ -365,26 +386,6 @@
     const done = pool.tasks.filter(t => t.done).length;
     const claimed = pool.tasks.filter(t => t.claimedBy && !t.done).length;
     return { total, done, claimed };
-  }
-
-  /* ==================== 续刷标记 ==================== */
-  function setResumeFlag() {
-    try {
-      sessionStorage.setItem(RESUME_KEY, JSON.stringify({
-        multiCount: settings.multiCount,
-        time: Date.now(),
-      }));
-    } catch (_) {}
-  }
-  function popResumeFlag() {
-    try {
-      const raw = sessionStorage.getItem(RESUME_KEY);
-      sessionStorage.removeItem(RESUME_KEY);
-      if (!raw) return null;
-      const v = JSON.parse(raw);
-      if (Date.now() - v.time < 60000) return v;
-    } catch (_) {}
-    return null;
   }
 
   /* ==================== 倍速控制 ==================== */
@@ -404,9 +405,7 @@
     const vids = [...document.querySelectorAll('video')];
     if (rate === null) {
       if (lastAppliedRate !== null) {
-        for (const v of vids) {
-          try { if (v.playbackRate === lastAppliedRate) v.playbackRate = 1; } catch (_) {}
-        }
+        for (const v of vids) { try { if (v.playbackRate === lastAppliedRate) v.playbackRate = 1; } catch (_) {} }
         lastAppliedRate = null;
       }
       return;
@@ -443,10 +442,7 @@
       verify.video = v; verify.active = false; verify.since = 0; verify.attempts = 0;
     }
     if (!isVideoFinished(v)) { verify.active = false; return null; }
-    if (!verify.active) {
-      verify.active = true; verify.since = Date.now();
-      return { state: 'waiting' };
-    }
+    if (!verify.active) { verify.active = true; verify.since = Date.now(); return { state: 'waiting' }; }
     if (Date.now() - verify.since < PROGRESS_WAIT_MS) return { state: 'waiting' };
     const p = findProgress();
     if (p !== null && p >= 100) return { state: 'done', progress: p };
@@ -520,8 +516,13 @@
 
   function runMulti() {
     const status = panel.querySelector('.status');
+
     if (isMultiChild()) {
       status.textContent = '当前是多线程子标签页，不能再次执行多线程。';
+      return;
+    }
+    if (isAutoOpenedDetailPage()) {
+      status.textContent = '本页由列表页自动打开，无需在此执行多线程；请到“我的专题班”列表页操作。';
       return;
     }
     if (multiRunning) {
@@ -551,14 +552,10 @@
       }
       const ids = computeRowTaskIds(incomplete);
       const tasks = incomplete.map((row, idx) => ({
-        id: ids[idx],
-        title: textOf(row.cells?.[1] || row).slice(0, 40),
+        id: ids[idx], title: textOf(row.cells?.[1] || row).slice(0, 40),
         claimedBy: null, claimTime: null, done: false,
       }));
-      if (!initPool(tasks)) {
-        status.textContent = '无法创建任务池（当前页面 URL 无法识别）。';
-        return;
-      }
+      if (!initPool(tasks)) { status.textContent = '无法创建任务池（当前页面 URL 无法识别）。'; return; }
       const count = Math.min(n, incomplete.length);
       let baseUrl = location.href.replace(/[?&]ccbMulti=[^&]*/g, '');
       const sep = baseUrl.includes('?') ? '&' : '?';
@@ -569,17 +566,20 @@
           if (w) opened++;
         } catch (_) {}
       }
-      if (!opened) {
-        status.textContent = '浏览器拦截了新标签页，请允许本站点弹出窗口后重试。';
-        return;
-      }
+      if (!opened) { status.textContent = '浏览器拦截了新标签页，请允许本站点弹出窗口后重试。'; return; }
       setMultiParent(true);
-      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页。每个线程完成视频后会自动关闭，父页会在任务池清空后返回列表继续。`;
+      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页。`;
       update();
       return;
     }
 
-    /* 列表页：打开多个专题班详情页 */
+    /* 列表页：先清理已关闭的子窗口 */
+    childWindows = childWindows.filter(isWindowAlive);
+    if (childWindows.length > 0) {
+      status.textContent = `仍有 ${childWindows.length} 个详情页在运行，请等待完成后重试。`;
+      return;
+    }
+
     const listUrls = collectListUrls();
     if (!listUrls.length) {
       status.textContent = '当前页面未识别到可打开的未完成专题班。请确认列表已加载完成后重试。';
@@ -587,21 +587,27 @@
     }
     const fresh = listUrls.filter(u => !openedRecently(u));
     const toOpen = (fresh.length ? fresh : listUrls).slice(0, n);
+
     let opened = 0;
+    childWindows = [];
     for (const url of toOpen) {
       try {
         const sep = url.includes('?') ? '&' : '?';
         const w = window.open(`${url}${sep}ccbAuto=1`, '_blank');
-        if (w) { opened++; markOpened([url]); }
+        if (w) { opened++; childWindows.push(w); markOpened([url]); }
       } catch (_) {}
     }
     if (!opened) {
       status.textContent = '浏览器拦截了新标签页，请允许本站点弹出窗口后重试。';
       return;
     }
+
     setMultiParent(true);
+    autoContinueEnabled = true;              // 允许自动续刷
+    lastRunMultiTime = Date.now();
+
     status.textContent = fresh.length
-      ? `已打开 ${opened} 个专题班详情页，每个标签页会自动进入并依次刷完该专题班未完成课程。`
+      ? `已打开 ${opened} 个专题班详情页；每个标签页会依次刷完自己负责的专题班后自动关闭。`
       : `这些专题班最近已打开过，已重新打开 ${opened} 个。`;
     update();
   }
@@ -625,14 +631,15 @@
         <input type="number" data-setting="multiCount" min="1" max="5" step="1">
         <button data-act="multi">一键执行</button>
       </div>
+      <label><input type="checkbox" data-setting="autoContinue"> 一批完成后自动开始下一批（仅在列表页有效）</label>
       <div class="status" aria-live="polite"></div>
       <div class="actions"></div>
-      <small>停止会暂停当前视频并同步停用其他建行标签中的自动操作。进度只读取平台数据。面板可拖动。</small>
+      <small>所有由脚本打开的详情页会在完成自己负责的专题班后自动关闭，不会持续叠加标签页。面板可拖动。</small>
     </div>`;
 
   const style = document.createElement('style');
   style.textContent = `
-    #ccb-helper-panel{position:fixed;z-index:2147483647;right:18px;top:110px;width:300px;background:#fff;color:#222;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 5px 22px #0003;font:14px/1.45 system-ui,sans-serif}
+    #ccb-helper-panel{position:fixed;z-index:2147483647;right:18px;top:110px;width:310px;background:#fff;color:#222;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 5px 22px #0003;font:14px/1.45 system-ui,sans-serif}
     #ccb-helper-panel header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#eff6ff;border-radius:10px 10px 0 0;cursor:move;user-select:none}
     #ccb-helper-panel .controls{display:flex;gap:5px;align-items:center}
     #ccb-helper-panel button{cursor:pointer;border:1px solid #cbd5e1;border-radius:6px;background:#fff;padding:4px 9px}
@@ -731,9 +738,7 @@
     panel.querySelector('[data-act="resume"]').hidden = isRunning;
     panel.classList.toggle('stopped', !isRunning);
     if (!isRunning) {
-      for (const video of document.querySelectorAll('video')) {
-        video.pause(); startedVideos.delete(video);
-      }
+      for (const video of document.querySelectorAll('video')) { video.pause(); startedVideos.delete(video); }
     }
     update();
   }
@@ -763,19 +768,12 @@
   /* ==================== 视频完成处理 ==================== */
   function onVideoComplete() {
     const cur = readCurrentTask();
-    if (cur) {
-      markTaskDone(cur.taskId);
-      writeCurrentTask(null);
-    }
-    // 多线程子标签页：关闭自己
-    if (isMultiChild() || (() => { try { return sessionStorage.getItem(MULTI_TAB_KEY) === '1'; } catch (_) { return false; } })()) {
-      try { window.close(); } catch (_) {}
-      // 若浏览器阻止 close，退到空白页
-      setTimeout(() => {
-        try { location.replace('about:blank'); } catch (_) {}
-      }, 800);
-      return;
-    }
+    if (cur) { markTaskDone(cur.taskId); writeCurrentTask(null); }
+
+    // 多线程子页：完成即关闭自己
+    if (isMultiChild()) { closeSelf('视频已完成，本标签页即将关闭…'); return; }
+
+    // 从列表自动打开的详情页（ccbAuto）：返回详情页继续刷本专题班
     goBackOrReturn();
   }
 
@@ -784,10 +782,7 @@
     const status = panel.querySelector('.status');
     const actions = panel.querySelector('.actions');
     actions.replaceChildren();
-    if (!isRunning) {
-      status.textContent = '脚本已停止；点击“继续执行”恢复。';
-      return;
-    }
+    if (!isRunning) { status.textContent = '脚本已停止；点击“继续执行”恢复。'; return; }
 
     /* ---------- 视频页 ---------- */
     if (isVideoPage()) {
@@ -839,22 +834,11 @@
 
     /* ---------- 列表页 ---------- */
     if (isClassListPage()) {
-      // 优先处理自动续刷
-      const resume = popResumeFlag();
-      if (resume && !multiParent) {
-        settings.multiCount = resume.multiCount;
-        syncUI();
-        status.textContent = `自动续刷：将从列表重新检索，使用 ${resume.multiCount} 个线程…`;
-        setTimeout(() => { if (isRunning) runMulti(); }, 1500);
-        return;
-      }
-    }
-
-    const cards = getCourseCards();
-    if (cards.length) {
+      const cards = getCourseCards();
       status.textContent = settings.autoOpen
-        ? `识别到 ${cards.length} 个未完成专题班；正在进入首个条目。`
-        : `识别到 ${cards.length} 个未完成专题班；可在下方选择进入。`;
+        ? `识别到 ${cards.length} 个未完成专题班。点击“一键执行”打开多线程标签；每个详情页完成自己的专题班后会自动关闭。`
+        : `识别到 ${cards.length} 个未完成专题班。`;
+
       cards.slice(0, 8).forEach(({ el, text }, i) => {
         const row = document.createElement('div');
         row.className = 'course';
@@ -869,9 +853,9 @@
         });
         row.append(title, btn); actions.append(row);
       });
-      if (settings.autoOpen && cards[0] && !multiParent && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) {
-        const firstLink = cards[0].link || (cards[0].el.matches?.('a[href]') ? cards[0].el : cards[0].el.querySelector('a[href]'));
-        autoClickOnce(firstLink);
+
+      if (autoContinueEnabled && childWindows.length) {
+        status.textContent += ` 当前 ${childWindows.length} 个详情页仍在运行，完成后会自动开始下一批。`;
       }
       return;
     }
@@ -889,28 +873,20 @@
       });
       const incomplete = parsed.filter(item => item.progress !== 100 && item.action);
       const ids = computeRowTaskIds(parsed.map(p => p.row));
+      const allDone = parsed.length && parsed.every(item => item.progress === 100);
 
-      /* 多线程父页：监视任务池 */
+      /* 多线程父页（用户主动打开的详情页上执行了 runMulti） */
       if (multiParent && !isMultiChild()) {
         const prog = getPoolProgress(getPoolId());
-        if (!prog) {
-          status.textContent = '多线程父页：任务池已结束。';
-          return;
-        }
+        if (!prog) { status.textContent = '多线程父页：任务池已结束，可关闭本页或在列表页重新执行。'; return; }
         status.textContent = `多线程父页：任务池 ${prog.done}/${prog.total} 完成，${prog.claimed} 个正在处理中。`;
         if (prog.done === prog.total && prog.claimed === 0) {
-          setResumeFlag();
-          status.textContent = '多线程父页：本专题班任务完成，准备返回列表继续…';
-          const navKey = `resume:${location.hash}`;
-          if (!autoClicked.has(navKey)) {
-            autoClicked.add(navKey);
-            setTimeout(() => { if (isRunning) location.assign('https://u.ccb.com/workshop/#/myworkshop'); }, 1500);
-          }
+          status.textContent = '多线程父页：本批任务全部完成。可关闭本页，或回到“我的专题班”列表再执行一批。';
         }
         return;
       }
 
-      /* 子标签页：任务池领取 */
+      /* 子标签页（ccbMulti）：按任务池领取 */
       if (isMultiChild()) {
         const poolId = getPoolId();
         if (!poolId) { status.textContent = '子标签页无法识别任务池，已停止。'; return; }
@@ -936,9 +912,13 @@
         const task = claimTask();
         if (!task) {
           const prog = getPoolProgress(poolId);
-          status.textContent = prog
-            ? `任务池已全部领取（${prog.done}/${prog.total} 完成，${prog.claimed} 处理中）。本线程任务完成，可关闭本标签页。`
-            : '任务池为空，本线程工作完成，可关闭。';
+          if (prog && prog.done === prog.total && prog.claimed === 0) {
+            closeSelf('任务全部完成，本标签页即将关闭…');
+          } else if (prog) {
+            status.textContent = `任务池已全部领取（${prog.done}/${prog.total} 完成，${prog.claimed} 处理中）。本线程暂时无任务，等待其他线程完成。`;
+          } else {
+            status.textContent = '任务池为空，等待中。';
+          }
           return;
         }
         const idx = ids.indexOf(task.id);
@@ -955,8 +935,8 @@
         return;
       }
 
-      /* 单线程详情页 */
-      status.textContent = `课程班内识别到 ${parsed.length} 门课程；按每行平台进度展示。`;
+      /* 单线程详情页（含 ccbAuto 自动打开的） */
+      status.textContent = `课程班内识别到 ${parsed.length} 门课程；${incomplete.length} 门未完成。`;
       parsed.forEach(({ title, progress, action }) => {
         const row = document.createElement('div');
         row.className = 'course';
@@ -986,17 +966,21 @@
           lastAutoActionTime = Date.now();
           incomplete[0].action.click();
         }
-      } else if (parsed.length && parsed.every(item => item.progress === 100)) {
-        status.textContent = '专题班内课程均显示 100%；返回专题班列表查找下一班。';
-        setResumeFlag();
-        autoNavigateOnce(location.hash, 'https://u.ccb.com/workshop/#/myworkshop');
+        return;
+      }
+
+      if (allDone) {
+        if (isAutoOpenedDetailPage()) {
+          closeSelf('本专题班已全部完成，本标签页即将关闭…');
+        } else {
+          status.textContent = '本专题班内课程均显示 100%。可关闭本页。';
+        }
       }
       return;
     }
 
     /* ---------- 课程详情页 ---------- */
     if (isCourseDetailPage()) {
-      // 等待页面稳定，避免加载中的误判
       if (Date.now() - pageLoadTime < DETAIL_SETTLE_MS) {
         status.textContent = '课程详情页加载中，等待页面稳定…';
         return;
@@ -1005,14 +989,11 @@
       const p = findProgress();
       status.textContent = `课程详情页：${p === null ? '未识别到课程进度' : `平台进度 ${p}%`}${continueButton ? '；可继续学习' : ''}`;
 
-      // 优先点击“继续学习”进入视频
       if (continueButton) {
         addButton(actions, textOf(continueButton) || '继续学习', () => continueButton.click());
         if (settings.autoOpen) autoClickOnce(continueButton);
         return;
       }
-
-      // 没有按钮且进度 100% 才认为完成
       if (p === 100) {
         status.textContent = '课程进度已达 100%；任务完成，准备返回。';
         addButton(actions, '完成并继续', () => onVideoComplete());
@@ -1033,10 +1014,6 @@
       status.textContent = '检测到“立即学习”入口。';
       addButton(actions, '立即学习', () => immediate.click());
       if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(immediate);
-      return;
-    }
-    if (isClassListPage()) {
-      status.textContent = '已在“我的专题班”页面；未识别到带未完成状态的课程条目，请检查页面是否加载完成。';
       return;
     }
     const start = findAction('我要学习');
@@ -1061,10 +1038,12 @@
 
   setInterval(update, 5000);
 
-  // 高频：倍速保持 + 播放恢复 + 进度校验 + 父页任务池监视
+  /* ==================== 高频轮询 + 自动续刷 ==================== */
   let lastCheckState = '';
   setInterval(() => {
     if (!isRunning) return;
+
+    /* 视频页：倍速保持 + 播放恢复 + 进度校验 */
     if (isVideoPage()) {
       applyRateAll();
       const v = currentVideo();
@@ -1079,17 +1058,26 @@
       }
       return;
     }
-    // 父页任务池监视：任务池空了立即返回列表
-    if (multiParent && !isMultiChild() && isWorkshopDetailPage()) {
-      const prog = getPoolProgress(getPoolId());
-      if (prog && prog.done === prog.total && prog.claimed === 0) {
-        setResumeFlag();
-        const navKey = `auto-resume:${location.hash}`;
-        if (!autoClicked.has(navKey)) {
-          autoClicked.add(navKey);
-          location.assign('https://u.ccb.com/workshop/#/myworkshop');
-        }
-      }
+
+    /* 列表页：自动续刷 */
+    if (isClassListPage() && autoContinueEnabled && settings.autoContinue) {
+      if (Date.now() - pageLoadTime < 5000) return;
+      // 清理已关闭的子窗口
+      const before = childWindows.length;
+      childWindows = childWindows.filter(isWindowAlive);
+      if (childWindows.length !== before) update();
+
+      if (childWindows.length > 0) return;
+
+      // 检查是否还有未完成专题班
+      const cards = getCourseCards();
+      if (!cards.length) { autoContinueEnabled = false; return; }
+
+      // 冷却
+      if (Date.now() - lastRunMultiTime < AUTO_CONTINUE_COOLDOWN) return;
+
+      // 触发下一批
+      runMulti();
     }
-  }, 800);
+  }, 1000);
 })();
