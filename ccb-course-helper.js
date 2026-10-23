@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         建行专题班学习辅助
 // @namespace    local.ccb.course-helper
-// @version      1.4.1
+// @version      1.4.2
 // @description  识别未完成课程，辅助进入课程并按设置播放；只读取平台真实进度，不模拟完成。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  /* ==================== 常量与设置 ==================== */
+  /* ==================== 常量 ==================== */
   const KEY = 'ccbCourseHelperSettingsV2';
   const RUN_KEY = 'ccbCourseHelperRunning';
   const OPENED_KEY = 'ccbCourseHelperOpenedTabs';
@@ -24,26 +24,21 @@
   const POOL_KEY = 'ccbMultiPoolV1';
   const CURRENT_TASK_KEY = 'ccbCurrentTask';
   const TAB_ID_KEY = 'ccbMultiTabId';
+  const RESUME_KEY = 'ccbAutoResume';
 
   const MAX_REPLAY = 3;
   const PROGRESS_WAIT_MS = 3500;
-  const OPENED_TTL = 5 * 60 * 1000;   // 去重时间缩短到 5 分钟
+  const OPENED_TTL = 30 * 60 * 1000;
   const CLAIM_TTL = 30 * 60 * 1000;
-  const PAGE_LOAD_COOLDOWN = 2000;     // 页面加载后 2 秒内不自动点击
-  const CLICK_COOLDOWN = 1500;         // 同一动作最小间隔
+  const PAGE_LOAD_COOLDOWN = 2000;
+  const CLICK_COOLDOWN = 1500;
+  const DETAIL_SETTLE_MS = 2500;   // 课程详情页稳定时间
 
   const defaults = {
-    autoOpen: true,
-    autoplay: true,
-    muted: true,
-    minimized: false,
-    force3x: false,
-    auto2x: false,
-    multiCount: 2,
-    panelX: null,
-    panelY: null,
+    autoOpen: true, autoplay: true, muted: true, minimized: false,
+    force3x: false, auto2x: false, multiCount: 2,
+    panelX: null, panelY: null,
   };
-
   const settings = {
     ...defaults,
     ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}),
@@ -59,7 +54,7 @@
   let lastAutoActionTime = 0;
   let multiRunning = false;
 
-  // 子线程身份：以 URL 为准，并持久化到 sessionStorage，保证视频页也能识别
+  /* ==================== 身份识别 ==================== */
   let _multiChildCache = null;
   function isMultiChild() {
     if (_multiChildCache !== null) return _multiChildCache;
@@ -69,26 +64,19 @@
       const params = new URLSearchParams(hash.slice(q + 1));
       if (params.has('ccbMulti')) {
         try { sessionStorage.setItem(MULTI_TAB_KEY, '1'); } catch (_) {}
-        _multiChildCache = true;
-        return true;
+        _multiChildCache = true; return true;
       }
       if (params.has('ccbAuto')) {
         try { sessionStorage.removeItem(MULTI_TAB_KEY); } catch (_) {}
-        _multiChildCache = false;
-        return false;
+        _multiChildCache = false; return false;
       }
     }
     try {
-      if (sessionStorage.getItem(MULTI_TAB_KEY) === '1') {
-        _multiChildCache = true;
-        return true;
-      }
+      if (sessionStorage.getItem(MULTI_TAB_KEY) === '1') { _multiChildCache = true; return true; }
     } catch (_) {}
-    _multiChildCache = false;
-    return false;
+    _multiChildCache = false; return false;
   }
 
-  // 父页身份（列表页/详情页发起多线程后不再自动点击）
   let multiParent = (() => {
     try { return sessionStorage.getItem(MULTI_PARENT_KEY) === '1'; } catch (_) { return false; }
   })();
@@ -97,7 +85,6 @@
     try { sessionStorage.setItem(MULTI_PARENT_KEY, v ? '1' : '0'); } catch (_) {}
   };
 
-  // 详情页带 ccbAuto=1 时强制单线程模式（用于列表页打开的子专题班页）
   try {
     const q = location.hash.split('?')[1];
     if (q) {
@@ -113,6 +100,7 @@
   const verify = { video: null, active: false, since: 0, attempts: 0, cooldownUntil: 0 };
   let lastAppliedRate = null;
 
+  /* ==================== 工具 ==================== */
   const save = () => typeof GM_setValue === 'function' && GM_setValue(KEY, settings);
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
@@ -127,44 +115,46 @@
   };
 
   /* ==================== 页面识别 ==================== */
-  function isVideoPage() {
-    return /^#\/play\/[^?]+/.test(location.hash) || !!document.querySelector('.player_area video');
-  }
-  function isCourseDetailPage() {
-    return location.pathname.replace(/\/$/, '') === '/course' && /^#\/detail\/[^?]+/.test(location.hash);
-  }
-  function isClassListPage() {
-    return /^#\/myworkshop(?:\?.*)?$/.test(location.hash);
-  }
-  function isWorkshopDetailPage() {
-    return /#\/myworkshop\/detail/.test(location.hash) || !!workshopDetailUrl();
-  }
+  const isVideoPage = () => /^#\/play\/[^?]+/.test(location.hash) || !!document.querySelector('.player_area video');
+  const isCourseDetailPage = () => location.pathname.replace(/\/$/, '') === '/course' && /^#\/detail\/[^?]+/.test(location.hash);
+  const isClassListPage = () => /^#\/myworkshop(?:\?.*)?$/.test(location.hash);
+  const isWorkshopDetailPage = () => /#\/myworkshop\/detail/.test(location.hash) || !!workshopDetailUrl();
 
   /* ==================== 进度读取 ==================== */
   function findProgress(root = document) {
-    const scope = root === document
-      ? (document.querySelector('.player_area') || (isCourseDetailPage() ? document.querySelector('.progress-v') : null) || document)
-      : root;
+    const detail = isCourseDetailPage();
+    let scope;
+    if (root === document) {
+      if (document.querySelector('.player_area')) scope = document.querySelector('.player_area');
+      else if (detail) {
+        scope = document.querySelector('.progress-v');
+        if (!scope) return null;
+      } else scope = document;
+    } else scope = root;
+    if (!scope) return null;
+
     const explicit = [...scope.querySelectorAll('[role="progressbar"],progress')]
       .filter(visible)
       .map(el => {
         const raw = el.getAttribute('aria-valuenow') ?? el.value ?? el.getAttribute('aria-valuetext') ?? '';
-        const matched = String(raw).match(/\d+(?:\.\d+)?/);
-        const n = matched ? Number(matched[0]) : NaN;
+        const m = String(raw).match(/\d+(?:\.\d+)?/);
+        const n = m ? Number(m[0]) : NaN;
         if (Number.isFinite(n)) return Math.max(0, Math.min(100, n));
-        const width = parseFloat(el.style.width || getComputedStyle(el).width);
-        const parentWidth = el.parentElement?.getBoundingClientRect().width || 0;
-        return parentWidth > 0 && Number.isFinite(width) ? Math.max(0, Math.min(100, width / parentWidth * 100)) : null;
+        const w = parseFloat(el.style.width || getComputedStyle(el).width);
+        const pw = el.parentElement?.getBoundingClientRect().width || 0;
+        return pw > 0 && Number.isFinite(w) ? Math.max(0, Math.min(100, w / pw * 100)) : null;
       }).filter(n => n !== null);
+
     const textual = [...scope.querySelectorAll('*')]
       .filter(el => visible(el) && el.children.length === 0)
       .map(el => textOf(el).match(progressRe)?.[1])
       .filter(Boolean).map(Number).filter(n => n >= 0 && n <= 100);
-    const values = [...explicit, ...textual];
-    return values.length ? Math.max(...values) : null;
+
+    const vals = [...explicit, ...textual];
+    return vals.length ? Math.max(...vals) : null;
   }
 
-  /* ==================== 课程条目识别 ==================== */
+  /* ==================== 课程卡片识别 ==================== */
   function getCourseCards() {
     const ccbLinks = [...document.querySelectorAll('a[href*="#/myworkshop/detail"]')]
       .filter(a => visible(a) && /未开始|未完成|进行中/.test(textOf(a)));
@@ -188,8 +178,7 @@
       for (let i = 0; i < 7 && el && el !== document.body; i++, el = el.parentElement) {
         const t = textOf(el);
         if (t.length > 30 && t.length < 1200 && /未开始|未完成|进行中/.test(t) && el.querySelector('a,button,[role="button"]')) {
-          found.add(el);
-          break;
+          found.add(el); break;
         }
       }
     }
@@ -199,6 +188,27 @@
   function findAction(label) {
     return [...document.querySelectorAll('a,button,[role="button"],.edit-block')]
       .find(el => visible(el) && textOf(el).includes(label));
+  }
+
+  /* 专门的“继续学习”按钮查找（覆盖多种 DOM 结构） */
+  function findContinueButton() {
+    for (const sel of ['button.to-learn', '.to-learn', '[class*="to-learn"]']) {
+      const els = [...document.querySelectorAll(sel)].filter(visible);
+      if (els.length) return els[0];
+    }
+    const exact = ['继续学习', '继续播放', '继续听课', '开始学习', '去学习'];
+    for (const label of exact) {
+      const el = [...document.querySelectorAll('a,button,[role="button"],div,span')]
+        .find(e => visible(e) && textOf(e) === label && e.getBoundingClientRect().width > 20);
+      if (el) return el;
+    }
+    const loose = ['继续学习', '继续播放', '继续听课', '开始学习', '去学习', '立即学习'];
+    for (const label of loose) {
+      const el = [...document.querySelectorAll('a,button,[role="button"],.edit-block')]
+        .find(e => visible(e) && textOf(e).includes(label));
+      if (el) return el;
+    }
+    return null;
   }
 
   function autoClickOnce(el) {
@@ -211,8 +221,8 @@
   }
 
   function workshopDetailUrl() {
-    const hashQuery = location.hash.split('?')[1] || '';
-    const id = new URLSearchParams(hashQuery).get('id') || new URLSearchParams(hashQuery).get('workshopId');
+    const q = location.hash.split('?')[1] || '';
+    const id = new URLSearchParams(q).get('id') || new URLSearchParams(q).get('workshopId');
     return id ? `https://u.ccb.com/workshop/#/myworkshop/detail?id=${encodeURIComponent(id)}` : null;
   }
 
@@ -271,10 +281,9 @@
   }
 
   function getPoolId() {
-    const hash = location.hash;
-    const q = hash.indexOf('?');
+    const q = location.hash.indexOf('?');
     if (q < 0) return null;
-    const params = new URLSearchParams(hash.slice(q + 1));
+    const params = new URLSearchParams(location.hash.slice(q + 1));
     const id = params.get('id') || params.get('workshopId');
     return id ? `ws:${id}` : null;
   }
@@ -311,8 +320,7 @@
       const now = Date.now();
       for (const t of pool.tasks) {
         if (t.claimedBy && !t.done && now - t.claimTime > CLAIM_TTL) {
-          t.claimedBy = null;
-          t.claimTime = null;
+          t.claimedBy = null; t.claimTime = null;
         }
       }
       const task = pool.tasks.find(t => !t.done && !t.claimedBy);
@@ -334,25 +342,21 @@
     if (!pool) return;
     const task = pool.tasks.find(t => t.id === taskId);
     if (task) {
-      task.done = true;
-      task.claimedBy = null;
-      task.claimTime = null;
+      task.done = true; task.claimedBy = null; task.claimTime = null;
       writePools(all);
     }
   }
 
-  function readCurrentTask() {
-    try {
-      const raw = sessionStorage.getItem(CURRENT_TASK_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (_) { return null; }
-  }
-  function writeCurrentTask(v) {
+  const readCurrentTask = () => {
+    try { const raw = sessionStorage.getItem(CURRENT_TASK_KEY); return raw ? JSON.parse(raw) : null; }
+    catch (_) { return null; }
+  };
+  const writeCurrentTask = (v) => {
     try {
       if (v) sessionStorage.setItem(CURRENT_TASK_KEY, JSON.stringify(v));
       else sessionStorage.removeItem(CURRENT_TASK_KEY);
     } catch (_) {}
-  }
+  };
 
   function getPoolProgress(poolId) {
     const pool = readPools()[poolId];
@@ -363,12 +367,28 @@
     return { total, done, claimed };
   }
 
-  /* ==================== 倍速控制 ==================== */
-  function targetRate() {
-    if (settings.force3x) return 3;
-    if (settings.auto2x) return 2;
+  /* ==================== 续刷标记 ==================== */
+  function setResumeFlag() {
+    try {
+      sessionStorage.setItem(RESUME_KEY, JSON.stringify({
+        multiCount: settings.multiCount,
+        time: Date.now(),
+      }));
+    } catch (_) {}
+  }
+  function popResumeFlag() {
+    try {
+      const raw = sessionStorage.getItem(RESUME_KEY);
+      sessionStorage.removeItem(RESUME_KEY);
+      if (!raw) return null;
+      const v = JSON.parse(raw);
+      if (Date.now() - v.time < 60000) return v;
+    } catch (_) {}
     return null;
   }
+
+  /* ==================== 倍速控制 ==================== */
+  const targetRate = () => (settings.force3x ? 3 : (settings.auto2x ? 2 : null));
 
   function applyRate(video) {
     const rate = targetRate();
@@ -399,7 +419,7 @@
     if (e.target && e.target.tagName === 'VIDEO') applyRate(e.target);
   }, true);
 
-  /* ==================== 播放完成后的进度校验 ==================== */
+  /* ==================== 进度校验 ==================== */
   function currentVideo() {
     const vids = [...document.querySelectorAll('video')].filter(visible);
     return vids.find(v => Number.isFinite(v.duration) && v.duration > 0) || vids[0] || null;
@@ -410,11 +430,8 @@
     return Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.25;
   }
   function resetVerify() {
-    verify.video = null;
-    verify.active = false;
-    verify.since = 0;
-    verify.attempts = 0;
-    verify.cooldownUntil = 0;
+    verify.video = null; verify.active = false; verify.since = 0;
+    verify.attempts = 0; verify.cooldownUntil = 0;
   }
 
   function ensureFullProgress() {
@@ -423,18 +440,11 @@
     const v = currentVideo();
     if (!v) return null;
     if (v !== verify.video) {
-      verify.video = v;
-      verify.active = false;
-      verify.since = 0;
-      verify.attempts = 0;
+      verify.video = v; verify.active = false; verify.since = 0; verify.attempts = 0;
     }
-    if (!isVideoFinished(v)) {
-      verify.active = false;
-      return null;
-    }
+    if (!isVideoFinished(v)) { verify.active = false; return null; }
     if (!verify.active) {
-      verify.active = true;
-      verify.since = Date.now();
+      verify.active = true; verify.since = Date.now();
       return { state: 'waiting' };
     }
     if (Date.now() - verify.since < PROGRESS_WAIT_MS) return { state: 'waiting' };
@@ -447,10 +457,7 @@
     try { v.currentTime = 0; } catch (_) {}
     try { v.muted = isMultiChild() ? true : !!settings.muted; } catch (_) {}
     startedVideos.delete(v);
-    try {
-      const pr = v.play();
-      if (pr?.catch) pr.catch(() => {});
-    } catch (_) {}
+    try { const pr = v.play(); if (pr?.catch) pr.catch(() => {}); } catch (_) {}
     return { state: 'replaying', attempts: verify.attempts, progress: p };
   }
 
@@ -468,11 +475,10 @@
       else startedVideos.add(video);
     }
     const rateTag = targetRate() ? `，${targetRate()}×` : '';
-    const muteTag = wantMuted ? '静音' : '有声';
-    return `已应用播放设置（${muteTag}${rateTag}${multi ? '，多线程强制静音' : ''}）`;
+    return `已应用播放设置（${wantMuted ? '静音' : '有声'}${rateTag}${multi ? '，多线程强制静音' : ''}）`;
   }
 
-  /* ==================== 多线程 ==================== */
+  /* ==================== 多线程启动 ==================== */
   function openedRecently(url) {
     if (typeof GM_getValue !== 'function') return false;
     const map = GM_getValue(OPENED_KEY, {}) || {};
@@ -490,20 +496,17 @@
   }
 
   function collectListUrls() {
-    const urls = [];
-    const seen = new Set();
+    const urls = []; const seen = new Set();
     const add = (href) => {
       if (!href || !/^https?:/i.test(href)) return;
       const clean = href.replace(/[?&]ccbMulti=[^&]*/g, '').replace(/[?&]ccbAuto=[^&]*/g, '');
       if (seen.has(clean)) return;
-      seen.add(clean);
-      urls.push(clean);
+      seen.add(clean); urls.push(clean);
     };
     for (const a of document.querySelectorAll('a[href*="#/myworkshop/detail"]')) {
       if (!visible(a)) continue;
       const card = a.closest('.mv10.ml20.content') || a.parentElement || a;
-      const t = `${textOf(a)} ${textOf(card)}`;
-      if (!/未开始|未完成|进行中/.test(t)) continue;
+      if (!/未开始|未完成|进行中/.test(`${textOf(a)} ${textOf(card)}`)) continue;
       add(a.href);
     }
     if (!urls.length) {
@@ -517,7 +520,6 @@
 
   function runMulti() {
     const status = panel.querySelector('.status');
-
     if (isMultiChild()) {
       status.textContent = '当前是多线程子标签页，不能再次执行多线程。';
       return;
@@ -531,7 +533,7 @@
 
     const n = Math.max(1, Math.min(5, Number(settings.multiCount) || 1));
 
-    /* ---------- 情况 A：专题班详情页 -> 创建任务池 + 打开子标签 ---------- */
+    /* 详情页：创建任务池 + 打开子标签 */
     if (isWorkshopDetailPage()) {
       const detailRows = [...document.querySelectorAll('tr')]
         .filter(row => visible(row) && row.querySelector('.edit-block') && row.querySelector('.percent-text'));
@@ -551,9 +553,7 @@
       const tasks = incomplete.map((row, idx) => ({
         id: ids[idx],
         title: textOf(row.cells?.[1] || row).slice(0, 40),
-        claimedBy: null,
-        claimTime: null,
-        done: false,
+        claimedBy: null, claimTime: null, done: false,
       }));
       if (!initPool(tasks)) {
         status.textContent = '无法创建任务池（当前页面 URL 无法识别）。';
@@ -564,9 +564,8 @@
       const sep = baseUrl.includes('?') ? '&' : '?';
       let opened = 0;
       for (let i = 0; i < count; i++) {
-        const url = `${baseUrl}${sep}ccbMulti=1`;
         try {
-          const w = window.open(url, '_blank');
+          const w = window.open(`${baseUrl}${sep}ccbMulti=1`, '_blank');
           if (w) opened++;
         } catch (_) {}
       }
@@ -575,12 +574,12 @@
         return;
       }
       setMultiParent(true);
-      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页。每个线程完成当前视频后会自动领取下一门未完成课程，任务池空后自动停止。`;
+      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页。每个线程完成视频后会自动关闭，父页会在任务池清空后返回列表继续。`;
       update();
       return;
     }
 
-    /* ---------- 情况 B：我的专题班列表页 -> 打开多个专题班详情页 ---------- */
+    /* 列表页：打开多个专题班详情页 */
     const listUrls = collectListUrls();
     if (!listUrls.length) {
       status.textContent = '当前页面未识别到可打开的未完成专题班。请确认列表已加载完成后重试。';
@@ -602,12 +601,12 @@
     }
     setMultiParent(true);
     status.textContent = fresh.length
-      ? `已打开 ${opened} 个专题班详情页，每个标签页会自动进入该专题班的第一个未完成课程并依次刷完。`
+      ? `已打开 ${opened} 个专题班详情页，每个标签页会自动进入并依次刷完该专题班未完成课程。`
       : `这些专题班最近已打开过，已重新打开 ${opened} 个。`;
     update();
   }
 
-  /* ==================== 控制面板 ==================== */
+  /* ==================== 面板 ==================== */
   const panel = document.createElement('section');
   panel.id = 'ccb-helper-panel';
   panel.innerHTML = `
@@ -669,9 +668,7 @@
       panel.style.right = 'auto';
       panel.style.left = rect.left + 'px';
       panel.style.top = rect.top + 'px';
-      dragging = true;
-      offX = e.clientX - rect.left;
-      offY = e.clientY - rect.top;
+      dragging = true; offX = e.clientX - rect.left; offY = e.clientY - rect.top;
       e.preventDefault();
     });
     document.addEventListener('mousemove', e => {
@@ -710,22 +707,14 @@
       } else {
         settings[name] = Math.max(1, Math.min(5, Number(input.value) || 1));
       }
-      save();
-      syncUI();
-      resetVerify();
-      applyRateAll();
-      update();
+      save(); syncUI(); resetVerify(); applyRateAll(); update();
     });
   }
 
   panel.querySelector('[data-act="rate3"]').addEventListener('click', () => {
     settings.force3x = !settings.force3x;
     if (settings.force3x) settings.auto2x = false;
-    save();
-    syncUI();
-    resetVerify();
-    applyRateAll();
-    update();
+    save(); syncUI(); resetVerify(); applyRateAll(); update();
   });
 
   panel.querySelector('[data-act="multi"]').addEventListener('click', runMulti);
@@ -743,8 +732,7 @@
     panel.classList.toggle('stopped', !isRunning);
     if (!isRunning) {
       for (const video of document.querySelectorAll('video')) {
-        video.pause();
-        startedVideos.delete(video);
+        video.pause(); startedVideos.delete(video);
       }
     }
     update();
@@ -759,7 +747,7 @@
     applyRunningState(true);
   });
   if (typeof GM_addValueChangeListener === 'function') {
-    GM_addValueChangeListener(RUN_KEY, (_name, _oldValue, newValue) => applyRunningState(newValue !== false));
+    GM_addValueChangeListener(RUN_KEY, (_n, _o, v) => applyRunningState(v !== false));
   }
   applyRunningState(isRunning);
   panel.classList.toggle('min', settings.minimized);
@@ -772,11 +760,21 @@
     actions.append(b);
   }
 
+  /* ==================== 视频完成处理 ==================== */
   function onVideoComplete() {
     const cur = readCurrentTask();
     if (cur) {
       markTaskDone(cur.taskId);
       writeCurrentTask(null);
+    }
+    // 多线程子标签页：关闭自己
+    if (isMultiChild() || (() => { try { return sessionStorage.getItem(MULTI_TAB_KEY) === '1'; } catch (_) { return false; } })()) {
+      try { window.close(); } catch (_) {}
+      // 若浏览器阻止 close，退到空白页
+      setTimeout(() => {
+        try { location.replace('about:blank'); } catch (_) {}
+      }, 800);
+      return;
     }
     goBackOrReturn();
   }
@@ -795,20 +793,10 @@
     if (isVideoPage()) {
       applyRateAll();
       const check = ensureFullProgress();
-
       if (check) {
-        if (check.state === 'waiting') {
-          status.textContent = `视频已播放完，正在等待平台回写进度… 当前 ${fmtProgress(findProgress())}`;
-          return;
-        }
-        if (check.state === 'cooldown') {
-          status.textContent = '正在重播视频，等待进度更新…';
-          return;
-        }
-        if (check.state === 'replaying') {
-          status.textContent = `播放结束但进度未记录满（${fmtProgress(check.progress)}），已第 ${check.attempts} 次重播该视频…`;
-          return;
-        }
+        if (check.state === 'waiting') { status.textContent = `视频已播放完，正在等待平台回写进度… 当前 ${fmtProgress(findProgress())}`; return; }
+        if (check.state === 'cooldown') { status.textContent = '正在重播视频，等待进度更新…'; return; }
+        if (check.state === 'replaying') { status.textContent = `播放结束但进度未记录满（${fmtProgress(check.progress)}），已第 ${check.attempts} 次重播该视频…`; return; }
         if (check.state === 'limit') {
           status.textContent = `已重播 ${MAX_REPLAY} 次，进度仍未满 100%（${fmtProgress(check.progress)}），请手动确认该视频。`;
           addButton(actions, '再重播一次', () => {
@@ -820,7 +808,7 @@
         }
         if (check.state === 'done') {
           status.textContent = `视频进度 ${check.progress}%。已记录为 100%，准备进入下一个未完成视频。`;
-          addButton(actions, '返回详情', () => onVideoComplete());
+          addButton(actions, '完成并继续', () => onVideoComplete());
           if (settings.autoOpen) {
             const navKey = `done:${location.hash}`;
             if (!autoClicked.has(navKey)) {
@@ -831,14 +819,13 @@
           return;
         }
       }
-
       const p = findProgress();
       const playResult = safePlayVideo();
       const rateTag = targetRate() ? `；当前 ${targetRate()}×` : '';
       status.textContent = `视频页面：${p === null ? '未识别到进度' : `页面进度 ${p}%`}${rateTag}；${playResult}`;
       if (p !== null && p >= 100) {
         status.textContent += '。该视频已记录为 100%，准备进入下一个未完成视频。';
-        addButton(actions, '返回详情', () => onVideoComplete());
+        addButton(actions, '完成并继续', () => onVideoComplete());
         if (settings.autoOpen) {
           const navKey = `done:${location.hash}`;
           if (!autoClicked.has(navKey)) {
@@ -850,7 +837,19 @@
       return;
     }
 
-    /* ---------- 我的专题班列表页 ---------- */
+    /* ---------- 列表页 ---------- */
+    if (isClassListPage()) {
+      // 优先处理自动续刷
+      const resume = popResumeFlag();
+      if (resume && !multiParent) {
+        settings.multiCount = resume.multiCount;
+        syncUI();
+        status.textContent = `自动续刷：将从列表重新检索，使用 ${resume.multiCount} 个线程…`;
+        setTimeout(() => { if (isRunning) runMulti(); }, 1500);
+        return;
+      }
+    }
+
     const cards = getCourseCards();
     if (cards.length) {
       status.textContent = settings.autoOpen
@@ -868,10 +867,9 @@
           const action = [...el.querySelectorAll('button,[role="button"]')].find(x => /进入|学习|查看|详情/.test(textOf(x)));
           if (link) location.href = link.href; else if (action) action.click(); else el.click();
         });
-        row.append(title, btn);
-        actions.append(row);
+        row.append(title, btn); actions.append(row);
       });
-      if (settings.autoOpen && cards[0] && !multiParent && (Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN)) {
+      if (settings.autoOpen && cards[0] && !multiParent && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) {
         const firstLink = cards[0].link || (cards[0].el.matches?.('a[href]') ? cards[0].el : cards[0].el.querySelector('a[href]'));
         autoClickOnce(firstLink);
       }
@@ -885,29 +883,37 @@
     if (detailRows.length) {
       const parsed = detailRows.map(row => {
         const title = textOf(row.cells?.[1]) || textOf(row);
-        const value = row.querySelector('.percent-text')?.textContent?.match(progressRe)?.[1];
-        const progress = value === undefined ? null : Number(value);
+        const v = row.querySelector('.percent-text')?.textContent?.match(progressRe)?.[1];
+        const progress = v === undefined ? null : Number(v);
         return { row, title, progress, action: row.querySelector('.edit-block') };
       });
       const incomplete = parsed.filter(item => item.progress !== 100 && item.action);
       const ids = computeRowTaskIds(parsed.map(p => p.row));
 
-      /* 父标签页：只显示任务池进度，不再自动动作 */
+      /* 多线程父页：监视任务池 */
       if (multiParent && !isMultiChild()) {
         const prog = getPoolProgress(getPoolId());
-        status.textContent = prog
-          ? `多线程父页：任务池 ${prog.done}/${prog.total} 完成，${prog.claimed} 个正在处理中。`
-          : '多线程父页：任务池已结束。可关闭本标签页。';
+        if (!prog) {
+          status.textContent = '多线程父页：任务池已结束。';
+          return;
+        }
+        status.textContent = `多线程父页：任务池 ${prog.done}/${prog.total} 完成，${prog.claimed} 个正在处理中。`;
+        if (prog.done === prog.total && prog.claimed === 0) {
+          setResumeFlag();
+          status.textContent = '多线程父页：本专题班任务完成，准备返回列表继续…';
+          const navKey = `resume:${location.hash}`;
+          if (!autoClicked.has(navKey)) {
+            autoClicked.add(navKey);
+            setTimeout(() => { if (isRunning) location.assign('https://u.ccb.com/workshop/#/myworkshop'); }, 1500);
+          }
+        }
         return;
       }
 
-      /* 子标签页：按任务池领取下一门 */
+      /* 子标签页：任务池领取 */
       if (isMultiChild()) {
         const poolId = getPoolId();
-        if (!poolId) {
-          status.textContent = '子标签页无法识别任务池，已停止。';
-          return;
-        }
+        if (!poolId) { status.textContent = '子标签页无法识别任务池，已停止。'; return; }
 
         const cur = readCurrentTask();
         if (cur) {
@@ -949,7 +955,7 @@
         return;
       }
 
-      /* 普通详情页（单线程） */
+      /* 单线程详情页 */
       status.textContent = `课程班内识别到 ${parsed.length} 门课程；按每行平台进度展示。`;
       parsed.forEach(({ title, progress, action }) => {
         const row = document.createElement('div');
@@ -980,8 +986,9 @@
           lastAutoActionTime = Date.now();
           incomplete[0].action.click();
         }
-      } else if (settings.autoOpen && parsed.length && parsed.every(item => item.progress === 100)) {
+      } else if (parsed.length && parsed.every(item => item.progress === 100)) {
         status.textContent = '专题班内课程均显示 100%；返回专题班列表查找下一班。';
+        setResumeFlag();
         autoNavigateOnce(location.hash, 'https://u.ccb.com/workshop/#/myworkshop');
       }
       return;
@@ -989,12 +996,26 @@
 
     /* ---------- 课程详情页 ---------- */
     if (isCourseDetailPage()) {
-      const continueButton = document.querySelector('button.to-learn') || findAction('继续学习');
+      // 等待页面稳定，避免加载中的误判
+      if (Date.now() - pageLoadTime < DETAIL_SETTLE_MS) {
+        status.textContent = '课程详情页加载中，等待页面稳定…';
+        return;
+      }
+      const continueButton = findContinueButton();
       const p = findProgress();
       status.textContent = `课程详情页：${p === null ? '未识别到课程进度' : `平台进度 ${p}%`}${continueButton ? '；可继续学习' : ''}`;
+
+      // 优先点击“继续学习”进入视频
+      if (continueButton) {
+        addButton(actions, textOf(continueButton) || '继续学习', () => continueButton.click());
+        if (settings.autoOpen) autoClickOnce(continueButton);
+        return;
+      }
+
+      // 没有按钮且进度 100% 才认为完成
       if (p === 100) {
-        status.textContent = '课程进度已达 100%；返回专题班详情核对其他课程。';
-        addButton(actions, '返回上一页核对其他课程', () => onVideoComplete());
+        status.textContent = '课程进度已达 100%；任务完成，准备返回。';
+        addButton(actions, '完成并继续', () => onVideoComplete());
         if (settings.autoOpen) {
           const navKey = `detail-done:${location.hash}`;
           if (!autoClicked.has(navKey)) {
@@ -1002,13 +1023,11 @@
             setTimeout(() => { if (isRunning) onVideoComplete(); }, 800);
           }
         }
-      } else if (continueButton && visible(continueButton)) {
-        addButton(actions, '继续学习', () => continueButton.click());
-        if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(continueButton);
       }
       return;
     }
 
+    /* ---------- 兜底 ---------- */
     const immediate = findAction('立即学习');
     if (immediate) {
       status.textContent = '检测到“立即学习”入口。';
@@ -1016,16 +1035,10 @@
       if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(immediate);
       return;
     }
-
     if (isClassListPage()) {
       status.textContent = '已在“我的专题班”页面；未识别到带未完成状态的课程条目，请检查页面是否加载完成。';
-      if (settings.autoOpen && !multiParent && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) {
-        const start = findAction('立即学习');
-        if (start) autoClickOnce(start);
-      }
       return;
     }
-
     const start = findAction('我要学习');
     if (start) {
       status.textContent = '检测到课程确认页。';
@@ -1033,7 +1046,6 @@
       if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(start);
       return;
     }
-
     status.textContent = '等待课程列表或视频页面…';
   }
 
@@ -1049,19 +1061,35 @@
 
   setInterval(update, 5000);
 
+  // 高频：倍速保持 + 播放恢复 + 进度校验 + 父页任务池监视
   let lastCheckState = '';
   setInterval(() => {
-    if (!isRunning || !isVideoPage()) return;
-    applyRateAll();
-    const v = currentVideo();
-    if (v && settings.autoplay && v.paused && !v.ended && !verify.active) {
-      try { v.play().catch(() => {}); } catch (_) {}
+    if (!isRunning) return;
+    if (isVideoPage()) {
+      applyRateAll();
+      const v = currentVideo();
+      if (v && settings.autoplay && v.paused && !v.ended && !verify.active) {
+        try { v.play().catch(() => {}); } catch (_) {}
+      }
+      const r = ensureFullProgress();
+      const token = r ? `${r.state}:${r.attempts ?? ''}` : '';
+      if (token && token !== lastCheckState && r.state !== 'waiting' && r.state !== 'cooldown') {
+        lastCheckState = token;
+        update();
+      }
+      return;
     }
-    const r = ensureFullProgress();
-    const token = r ? `${r.state}:${r.attempts ?? ''}` : '';
-    if (token && token !== lastCheckState && r.state !== 'waiting' && r.state !== 'cooldown') {
-      lastCheckState = token;
-      update();
+    // 父页任务池监视：任务池空了立即返回列表
+    if (multiParent && !isMultiChild() && isWorkshopDetailPage()) {
+      const prog = getPoolProgress(getPoolId());
+      if (prog && prog.done === prog.total && prog.claimed === 0) {
+        setResumeFlag();
+        const navKey = `auto-resume:${location.hash}`;
+        if (!autoClicked.has(navKey)) {
+          autoClicked.add(navKey);
+          location.assign('https://u.ccb.com/workshop/#/myworkshop');
+        }
+      }
     }
   }, 800);
 })();
