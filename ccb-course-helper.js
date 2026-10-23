@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         建行专题班学习辅助
 // @namespace    local.ccb.course-helper
-// @version      1.4.0
+// @version      1.4.1
 // @description  识别未完成课程，辅助进入课程并按设置播放；只读取平台真实进度，不模拟完成。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -20,14 +20,17 @@
   const OPENED_KEY = 'ccbCourseHelperOpenedTabs';
   const RETURN_KEY = 'ccbReturnUrl';
   const MULTI_PARENT_KEY = 'ccbMultiParent';
+  const MULTI_TAB_KEY = 'ccbIsMultiTab';
   const POOL_KEY = 'ccbMultiPoolV1';
   const CURRENT_TASK_KEY = 'ccbCurrentTask';
   const TAB_ID_KEY = 'ccbMultiTabId';
 
   const MAX_REPLAY = 3;
   const PROGRESS_WAIT_MS = 3500;
-  const OPENED_TTL = 30 * 60 * 1000;
+  const OPENED_TTL = 5 * 60 * 1000;   // 去重时间缩短到 5 分钟
   const CLAIM_TTL = 30 * 60 * 1000;
+  const PAGE_LOAD_COOLDOWN = 2000;     // 页面加载后 2 秒内不自动点击
+  const CLICK_COOLDOWN = 1500;         // 同一动作最小间隔
 
   const defaults = {
     autoOpen: true,
@@ -49,10 +52,43 @@
 
   let isRunning = typeof GM_getValue === 'function' ? GM_getValue(RUN_KEY, true) !== false : true;
 
+  const pageLoadTime = Date.now();
   const autoClicked = new Set();
   const startedVideos = new WeakSet();
   const clickedCourses = new Set();
+  let lastAutoActionTime = 0;
+  let multiRunning = false;
 
+  // 子线程身份：以 URL 为准，并持久化到 sessionStorage，保证视频页也能识别
+  let _multiChildCache = null;
+  function isMultiChild() {
+    if (_multiChildCache !== null) return _multiChildCache;
+    const hash = location.hash;
+    const q = hash.indexOf('?');
+    if (q >= 0) {
+      const params = new URLSearchParams(hash.slice(q + 1));
+      if (params.has('ccbMulti')) {
+        try { sessionStorage.setItem(MULTI_TAB_KEY, '1'); } catch (_) {}
+        _multiChildCache = true;
+        return true;
+      }
+      if (params.has('ccbAuto')) {
+        try { sessionStorage.removeItem(MULTI_TAB_KEY); } catch (_) {}
+        _multiChildCache = false;
+        return false;
+      }
+    }
+    try {
+      if (sessionStorage.getItem(MULTI_TAB_KEY) === '1') {
+        _multiChildCache = true;
+        return true;
+      }
+    } catch (_) {}
+    _multiChildCache = false;
+    return false;
+  }
+
+  // 父页身份（列表页/详情页发起多线程后不再自动点击）
   let multiParent = (() => {
     try { return sessionStorage.getItem(MULTI_PARENT_KEY) === '1'; } catch (_) { return false; }
   })();
@@ -60,6 +96,19 @@
     multiParent = !!v;
     try { sessionStorage.setItem(MULTI_PARENT_KEY, v ? '1' : '0'); } catch (_) {}
   };
+
+  // 详情页带 ccbAuto=1 时强制单线程模式（用于列表页打开的子专题班页）
+  try {
+    const q = location.hash.split('?')[1];
+    if (q) {
+      const params = new URLSearchParams(q);
+      if (params.has('ccbAuto')) {
+        sessionStorage.setItem(MULTI_PARENT_KEY, '0');
+        sessionStorage.removeItem(MULTI_TAB_KEY);
+        multiParent = false;
+      }
+    }
+  } catch (_) {}
 
   const verify = { video: null, active: false, since: 0, attempts: 0, cooldownUntil: 0 };
   let lastAppliedRate = null;
@@ -81,20 +130,14 @@
   function isVideoPage() {
     return /^#\/play\/[^?]+/.test(location.hash) || !!document.querySelector('.player_area video');
   }
-
   function isCourseDetailPage() {
     return location.pathname.replace(/\/$/, '') === '/course' && /^#\/detail\/[^?]+/.test(location.hash);
   }
-
   function isClassListPage() {
     return /^#\/myworkshop(?:\?.*)?$/.test(location.hash);
   }
-
-  function isMultiChild() {
-    const hash = location.hash;
-    const q = hash.indexOf('?');
-    if (q < 0) return false;
-    return new URLSearchParams(hash.slice(q + 1)).has('ccbMulti');
+  function isWorkshopDetailPage() {
+    return /#\/myworkshop\/detail/.test(location.hash) || !!workshopDetailUrl();
   }
 
   /* ==================== 进度读取 ==================== */
@@ -134,7 +177,6 @@
       return [...roots.values()];
     }
     if (!isClassListPage()) return [];
-
     const leaves = [...document.querySelectorAll('body *')].filter(el => {
       if (!visible(el) || el.children.length > 2) return false;
       const t = textOf(el);
@@ -163,6 +205,7 @@
     const key = `${location.pathname}${location.hash}:${textOf(el)}`;
     if (el && !autoClicked.has(key)) {
       autoClicked.add(key);
+      lastAutoActionTime = Date.now();
       el.click();
     }
   }
@@ -181,28 +224,28 @@
     }
   }
 
-  /* ==================== 返回地址（保留 ccbMulti 参数） ==================== */
+  /* ==================== 返回地址 ==================== */
   function setReturnUrl() {
     try { sessionStorage.setItem(RETURN_KEY, location.href); } catch (_) {}
   }
 
-  function getReturnUrl() {
-    try {
-      const saved = sessionStorage.getItem(RETURN_KEY);
-      if (saved && saved !== location.href) return saved;
-    } catch (_) {}
-    return workshopDetailUrl();
-  }
-
   function goBackOrReturn() {
-    const target = getReturnUrl();
-    if (target) {
+    let target = null;
+    try { target = sessionStorage.getItem(RETURN_KEY); } catch (_) {}
+    if (!target || target === location.href) {
+      target = workshopDetailUrl();
+      if (target && isMultiChild()) {
+        const sep = target.includes('?') ? '&' : '?';
+        target = `${target}${sep}ccbMulti=1`;
+      }
+    }
+    if (target && target !== location.href) {
       const key = `return:${location.hash}`;
       if (!autoClicked.has(key)) {
         autoClicked.add(key);
         location.assign(target);
+        return true;
       }
-      return true;
     }
     const back = document.querySelector('.player_area .return-btn') || document.querySelector('.return-btn');
     const key = `back:${location.hash}`;
@@ -236,14 +279,8 @@
     return id ? `ws:${id}` : null;
   }
 
-  function readPools() {
-    if (typeof GM_getValue !== 'function') return {};
-    return GM_getValue(POOL_KEY, {}) || {};
-  }
-
-  function writePools(all) {
-    if (typeof GM_setValue === 'function') GM_setValue(POOL_KEY, all);
-  }
+  const readPools = () => (typeof GM_getValue === 'function' ? GM_getValue(POOL_KEY, {}) || {} : {});
+  const writePools = (all) => { if (typeof GM_setValue === 'function') GM_setValue(POOL_KEY, all); };
 
   function initPool(tasks) {
     const poolId = getPoolId();
@@ -367,13 +404,11 @@
     const vids = [...document.querySelectorAll('video')].filter(visible);
     return vids.find(v => Number.isFinite(v.duration) && v.duration > 0) || vids[0] || null;
   }
-
   function isVideoFinished(v) {
     if (!v) return false;
     if (v.ended) return true;
     return Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.25;
   }
-
   function resetVerify() {
     verify.video = null;
     verify.active = false;
@@ -385,10 +420,8 @@
   function ensureFullProgress() {
     if (!isVideoPage()) return null;
     if (Date.now() < verify.cooldownUntil) return { state: 'cooldown' };
-
     const v = currentVideo();
     if (!v) return null;
-
     if (v !== verify.video) {
       verify.video = v;
       verify.active = false;
@@ -405,11 +438,9 @@
       return { state: 'waiting' };
     }
     if (Date.now() - verify.since < PROGRESS_WAIT_MS) return { state: 'waiting' };
-
     const p = findProgress();
     if (p !== null && p >= 100) return { state: 'done', progress: p };
     if (verify.attempts >= MAX_REPLAY) return { state: 'limit', progress: p };
-
     verify.attempts += 1;
     verify.active = false;
     verify.cooldownUntil = Date.now() + 2000;
@@ -423,23 +454,19 @@
     return { state: 'replaying', attempts: verify.attempts, progress: p };
   }
 
-  /* ==================== 播放（多线程强制静音 + 持续恢复播放） ==================== */
+  /* ==================== 播放 ==================== */
   function safePlayVideo() {
     const video = [...document.querySelectorAll('video')].find(visible);
     if (!video) return '尚未检测到 HTML 视频播放器';
-
     const multi = isMultiChild();
     const wantMuted = multi ? true : !!settings.muted;
     try { video.muted = wantMuted; } catch (_) {}
     applyRate(video);
-
-    // 后台标签页被浏览器暂停时持续尝试恢复
     if (settings.autoplay && video.paused && !video.ended) {
       const p = video.play();
       if (p?.then) p.then(() => startedVideos.add(video)).catch(() => {});
       else startedVideos.add(video);
     }
-
     const rateTag = targetRate() ? `，${targetRate()}×` : '';
     const muteTag = wantMuted ? '静音' : '有声';
     return `已应用播放设置（${muteTag}${rateTag}${multi ? '，多线程强制静音' : ''}）`;
@@ -465,26 +492,53 @@
   function collectListUrls() {
     const urls = [];
     const seen = new Set();
+    const add = (href) => {
+      if (!href || !/^https?:/i.test(href)) return;
+      const clean = href.replace(/[?&]ccbMulti=[^&]*/g, '').replace(/[?&]ccbAuto=[^&]*/g, '');
+      if (seen.has(clean)) return;
+      seen.add(clean);
+      urls.push(clean);
+    };
     for (const a of document.querySelectorAll('a[href*="#/myworkshop/detail"]')) {
       if (!visible(a)) continue;
       const card = a.closest('.mv10.ml20.content') || a.parentElement || a;
       const t = `${textOf(a)} ${textOf(card)}`;
       if (!/未开始|未完成|进行中/.test(t)) continue;
-      if (!a.href) continue;
-      const clean = a.href.replace(/[?&]ccbMulti=[^&]*/g, '');
-      if (!seen.has(clean)) { seen.add(clean); urls.push(clean); }
+      add(a.href);
+    }
+    if (!urls.length) {
+      for (const c of getCourseCards()) {
+        const a = c.link || (c.el.matches?.('a[href]') ? c.el : c.el.querySelector?.('a[href]'));
+        if (a && a.href) add(a.href);
+      }
     }
     return urls;
   }
 
   function runMulti() {
     const status = panel.querySelector('.status');
+
+    if (isMultiChild()) {
+      status.textContent = '当前是多线程子标签页，不能再次执行多线程。';
+      return;
+    }
+    if (multiRunning) {
+      status.textContent = '多线程正在启动中，请稍候…';
+      return;
+    }
+    multiRunning = true;
+    setTimeout(() => { multiRunning = false; }, 3000);
+
     const n = Math.max(1, Math.min(5, Number(settings.multiCount) || 1));
 
-    // 详情页：创建任务池 + 打开子标签页
-    const detailRows = [...document.querySelectorAll('tr')]
-      .filter(row => visible(row) && row.querySelector('.edit-block') && row.querySelector('.percent-text'));
-    if (detailRows.length) {
+    /* ---------- 情况 A：专题班详情页 -> 创建任务池 + 打开子标签 ---------- */
+    if (isWorkshopDetailPage()) {
+      const detailRows = [...document.querySelectorAll('tr')]
+        .filter(row => visible(row) && row.querySelector('.edit-block') && row.querySelector('.percent-text'));
+      if (!detailRows.length) {
+        status.textContent = '详情页课程表格尚未加载，请稍后重试。';
+        return;
+      }
       const incomplete = detailRows.filter(row => {
         const v = row.querySelector('.percent-text')?.textContent?.match(progressRe)?.[1];
         return v === undefined || Number(v) < 100;
@@ -521,33 +575,36 @@
         return;
       }
       setMultiParent(true);
-      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页同时处理。每个线程完成当前视频后会自动领取下一门未完成课程。`;
+      status.textContent = `已创建任务池（共 ${incomplete.length} 门课程），打开 ${opened} 个线程标签页。每个线程完成当前视频后会自动领取下一门未完成课程，任务池空后自动停止。`;
       update();
       return;
     }
 
-    // 列表页：打开多个专题班详情页（各自独立处理）
-    const listUrls = collectListUrls().filter(u => !openedRecently(u));
-    if (listUrls.length) {
-      const picked = listUrls.slice(0, n);
-      let opened = 0;
-      for (const url of picked) {
-        try {
-          const w = window.open(url, '_blank');
-          if (w) { opened++; markOpened([url]); }
-        } catch (_) {}
-      }
-      if (!opened) {
-        status.textContent = '浏览器拦截了新标签页，请允许本站点弹出窗口后重试。';
-        return;
-      }
-      setMultiParent(true);
-      status.textContent = `已打开 ${opened} 个专题班标签页，每个标签页将自动进入该专题班的首个未完成课程。`;
-      update();
+    /* ---------- 情况 B：我的专题班列表页 -> 打开多个专题班详情页 ---------- */
+    const listUrls = collectListUrls();
+    if (!listUrls.length) {
+      status.textContent = '当前页面未识别到可打开的未完成专题班。请确认列表已加载完成后重试。';
       return;
     }
-
-    status.textContent = '当前页面没有可多开的课程，请回到“我的专题班”列表或专题班详情页后重试。';
+    const fresh = listUrls.filter(u => !openedRecently(u));
+    const toOpen = (fresh.length ? fresh : listUrls).slice(0, n);
+    let opened = 0;
+    for (const url of toOpen) {
+      try {
+        const sep = url.includes('?') ? '&' : '?';
+        const w = window.open(`${url}${sep}ccbAuto=1`, '_blank');
+        if (w) { opened++; markOpened([url]); }
+      } catch (_) {}
+    }
+    if (!opened) {
+      status.textContent = '浏览器拦截了新标签页，请允许本站点弹出窗口后重试。';
+      return;
+    }
+    setMultiParent(true);
+    status.textContent = fresh.length
+      ? `已打开 ${opened} 个专题班详情页，每个标签页会自动进入该专题班的第一个未完成课程并依次刷完。`
+      : `这些专题班最近已打开过，已重新打开 ${opened} 个。`;
+    update();
   }
 
   /* ==================== 控制面板 ==================== */
@@ -597,14 +654,12 @@
     #ccb-helper-panel .multi-row input{width:56px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px}`;
   document.documentElement.append(style, panel);
 
-  // 恢复上次拖拽位置
   if (typeof settings.panelX === 'number' && typeof settings.panelY === 'number') {
     panel.style.right = 'auto';
     panel.style.left = Math.max(0, settings.panelX) + 'px';
     panel.style.top = Math.max(0, settings.panelY) + 'px';
   }
 
-  // 拖动
   (() => {
     const header = panel.querySelector('header');
     let dragging = false, offX = 0, offY = 0;
@@ -717,9 +772,7 @@
     actions.append(b);
   }
 
-  /* ==================== 视频完成处理 ==================== */
   function onVideoComplete() {
-    // 多线程子标签页：标记当前任务完成，下次回到详情页会自动领取下一门
     const cur = readCurrentTask();
     if (cur) {
       markTaskDone(cur.taskId);
@@ -738,6 +791,7 @@
       return;
     }
 
+    /* ---------- 视频页 ---------- */
     if (isVideoPage()) {
       applyRateAll();
       const check = ensureFullProgress();
@@ -796,6 +850,7 @@
       return;
     }
 
+    /* ---------- 我的专题班列表页 ---------- */
     const cards = getCourseCards();
     if (cards.length) {
       status.textContent = settings.autoOpen
@@ -816,14 +871,14 @@
         row.append(title, btn);
         actions.append(row);
       });
-      if (settings.autoOpen && cards[0] && !multiParent) {
+      if (settings.autoOpen && cards[0] && !multiParent && (Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN)) {
         const firstLink = cards[0].link || (cards[0].el.matches?.('a[href]') ? cards[0].el : cards[0].el.querySelector('a[href]'));
         autoClickOnce(firstLink);
       }
       return;
     }
 
-    // ===== 详情页 =====
+    /* ---------- 专题班详情页 ---------- */
     const detailRows = [...document.querySelectorAll('tr')]
       .filter(row => visible(row) && row.querySelector('.edit-block') && row.querySelector('.percent-text'));
 
@@ -837,28 +892,31 @@
       const incomplete = parsed.filter(item => item.progress !== 100 && item.action);
       const ids = computeRowTaskIds(parsed.map(p => p.row));
 
-      // 多线程父标签页：显示任务池进度
+      /* 父标签页：只显示任务池进度，不再自动动作 */
       if (multiParent && !isMultiChild()) {
         const prog = getPoolProgress(getPoolId());
-        if (prog) {
-          status.textContent = `多线程父页：任务池 ${prog.done}/${prog.total} 完成，${prog.claimed} 个正在处理中。`;
-        } else {
-          status.textContent = '多线程父页：任务池已结束。可关闭本标签页。';
-        }
+        status.textContent = prog
+          ? `多线程父页：任务池 ${prog.done}/${prog.total} 完成，${prog.claimed} 个正在处理中。`
+          : '多线程父页：任务池已结束。可关闭本标签页。';
         return;
       }
 
-      // 多线程子标签页：按任务池领取下一门
+      /* 子标签页：按任务池领取下一门 */
       if (isMultiChild()) {
         const poolId = getPoolId();
+        if (!poolId) {
+          status.textContent = '子标签页无法识别任务池，已停止。';
+          return;
+        }
 
-        // 若已有进行中的任务（视频返回后），继续点击该任务
         const cur = readCurrentTask();
         if (cur) {
           const task = readPools()[cur.poolId]?.tasks.find(t => t.id === cur.taskId);
           if (task && !task.done) {
+            if (Date.now() - lastAutoActionTime < CLICK_COOLDOWN) return;
             const idx = ids.indexOf(task.id);
             if (idx >= 0 && parsed[idx].action) {
+              lastAutoActionTime = Date.now();
               setReturnUrl();
               status.textContent = `继续任务：${task.title}，准备进入。`;
               parsed[idx].action.click();
@@ -868,24 +926,22 @@
           writeCurrentTask(null);
         }
 
-        // 领取新任务
+        if (Date.now() - lastAutoActionTime < CLICK_COOLDOWN) return;
         const task = claimTask();
         if (!task) {
           const prog = getPoolProgress(poolId);
           status.textContent = prog
-            ? `任务池已全部领取（${prog.done}/${prog.total} 完成，${prog.claimed} 处理中）。本线程无更多可执行任务，可关闭。`
+            ? `任务池已全部领取（${prog.done}/${prog.total} 完成，${prog.claimed} 处理中）。本线程任务完成，可关闭本标签页。`
             : '任务池为空，本线程工作完成，可关闭。';
           return;
         }
-
         const idx = ids.indexOf(task.id);
         if (idx < 0 || !parsed[idx].action) {
-          // 页面结构与任务池不一致，跳过该任务再领下一个
           markTaskDone(task.id);
           status.textContent = `任务 ${task.title} 未找到对应行，已跳过。`;
           return;
         }
-
+        lastAutoActionTime = Date.now();
         setReturnUrl();
         writeCurrentTask({ poolId, taskId: task.id });
         status.textContent = `已领取任务：${task.title}，准备进入。`;
@@ -893,7 +949,7 @@
         return;
       }
 
-      // 普通详情页（单线程）
+      /* 普通详情页（单线程） */
       status.textContent = `课程班内识别到 ${parsed.length} 门课程；按每行平台进度展示。`;
       parsed.forEach(({ title, progress, action }) => {
         const row = document.createElement('div');
@@ -915,10 +971,13 @@
       });
 
       if (settings.autoOpen && incomplete.length) {
+        if (Date.now() - pageLoadTime < PAGE_LOAD_COOLDOWN) return;
+        if (Date.now() - lastAutoActionTime < CLICK_COOLDOWN) return;
         setReturnUrl();
         const key = `first:${incomplete[0].title}`;
         if (!clickedCourses.has(key)) {
           clickedCourses.add(key);
+          lastAutoActionTime = Date.now();
           incomplete[0].action.click();
         }
       } else if (settings.autoOpen && parsed.length && parsed.every(item => item.progress === 100)) {
@@ -928,7 +987,7 @@
       return;
     }
 
-    // ===== 课程详情页 =====
+    /* ---------- 课程详情页 ---------- */
     if (isCourseDetailPage()) {
       const continueButton = document.querySelector('button.to-learn') || findAction('继续学习');
       const p = findProgress();
@@ -945,7 +1004,7 @@
         }
       } else if (continueButton && visible(continueButton)) {
         addButton(actions, '继续学习', () => continueButton.click());
-        if (settings.autoOpen) autoClickOnce(continueButton);
+        if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(continueButton);
       }
       return;
     }
@@ -954,13 +1013,13 @@
     if (immediate) {
       status.textContent = '检测到“立即学习”入口。';
       addButton(actions, '立即学习', () => immediate.click());
-      if (settings.autoOpen) autoClickOnce(immediate);
+      if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(immediate);
       return;
     }
 
     if (isClassListPage()) {
       status.textContent = '已在“我的专题班”页面；未识别到带未完成状态的课程条目，请检查页面是否加载完成。';
-      if (settings.autoOpen && !multiParent) {
+      if (settings.autoOpen && !multiParent && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) {
         const start = findAction('立即学习');
         if (start) autoClickOnce(start);
       }
@@ -971,7 +1030,7 @@
     if (start) {
       status.textContent = '检测到课程确认页。';
       addButton(actions, '我要学习', () => start.click());
-      if (settings.autoOpen) autoClickOnce(start);
+      if (settings.autoOpen && Date.now() - pageLoadTime > PAGE_LOAD_COOLDOWN) autoClickOnce(start);
       return;
     }
 
@@ -990,12 +1049,10 @@
 
   setInterval(update, 5000);
 
-  // 倍速保持 + 播放恢复 + 进度校验的高频轮询
   let lastCheckState = '';
   setInterval(() => {
     if (!isRunning || !isVideoPage()) return;
     applyRateAll();
-    // 持续恢复被浏览器暂停的播放
     const v = currentVideo();
     if (v && settings.autoplay && v.paused && !v.ended && !verify.active) {
       try { v.play().catch(() => {}); } catch (_) {}
