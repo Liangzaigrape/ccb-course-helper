@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.3.0
+// @version      1.4.0
 // @description  识别未完成课程，辅助进入课程并按设置播放；只读取平台真实进度，不模拟完成。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -14,7 +14,7 @@
   'use strict';
 
   const KEY = 'ccbCourseHelperSettingsV2';
-  const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, minimized: false };
+  const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, forced3: false, minimized: false };
   const settings = { ...defaults, ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}) };
   const autoClicked = new Set();
   const save = () => typeof GM_setValue === 'function' && GM_setValue(KEY, settings);
@@ -22,10 +22,9 @@
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
   const textOf = el => norm(el?.innerText || el?.textContent || '');
   const progressRe = /(\d{1,3}(?:\.\d+)?)\s*%/;
-  let forced3 = false;
 
   const visibleVideo = () => [...document.querySelectorAll('video')].find(visible);
-  const targetRate = () => (forced3 ? 3 : (settings.auto2x ? 2 : 0));
+  const targetRate = () => (settings.forced3 ? 3 : (settings.auto2x ? 2 : 0));
 
   function applyPlaybackRate(video) {
     const v = video || visibleVideo();
@@ -223,7 +222,7 @@
     input.addEventListener('change', () => {
       settings[name] = input.checked;
       save();
-      if (name === 'auto2x' && !input.checked && !forced3) {
+      if (name === 'auto2x' && !input.checked && !settings.forced3) {
         const video = visibleVideo();
         if (video && Math.abs(video.playbackRate - 2) < 1e-6) {
           try { video.playbackRate = 1; } catch { /* 忽略 */ }
@@ -244,16 +243,17 @@
   const rateStatus = panel.querySelector('.rate-status');
 
   function refreshForce3UI() {
-    force3Btn.textContent = forced3 ? '取消强制 3 倍速' : '强制 3 倍速';
-    force3Btn.classList.toggle('active', forced3);
-    rateStatus.textContent = forced3 ? '已强制 3 倍速' : '';
+    force3Btn.textContent = settings.forced3 ? '取消强制 3 倍速' : '强制 3 倍速';
+    force3Btn.classList.toggle('active', !!settings.forced3);
+    rateStatus.textContent = settings.forced3 ? '已强制 3 倍速' : '';
   }
 
   force3Btn.addEventListener('click', () => {
-    forced3 = !forced3;
+    settings.forced3 = !settings.forced3;
+    save();
     const video = visibleVideo();
     if (video) {
-      if (!forced3 && !settings.auto2x) {
+      if (!settings.forced3 && !settings.auto2x) {
         try { video.playbackRate = 1; } catch { /* 忽略 */ }
       } else {
         applyPlaybackRate(video);
