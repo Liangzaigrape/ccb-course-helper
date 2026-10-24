@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         建行专题班学习辅助-单线程版本
+// @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.2.0
+// @version      1.3.0
 // @description  识别未完成课程，辅助进入课程并按设置播放；只读取平台真实进度，不模拟完成。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -22,7 +22,6 @@
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
   const textOf = el => norm(el?.innerText || el?.textContent || '');
   const progressRe = /(\d{1,3}(?:\.\d+)?)\s*%/;
-  const startedVideos = new WeakSet();
   let forced3 = false;
 
   const visibleVideo = () => [...document.querySelectorAll('video')].find(visible);
@@ -144,23 +143,43 @@
     }
   }
 
-  function safePlayVideo() {
+  // 进度未满 100% 时保持播放；视频播完但平台进度尚未达标，则等待片刻后从头重播。
+  let endedSince = 0;
+  const REPLAY_DELAY = 8000;   // 播完后先等平台更新进度，避免无谓重播
+  let lastPlayAttempt = 0;
+
+  function keepVideoPlaying(video) {
+    const now = Date.now();
+    if (video.ended) {
+      if (!endedSince) { endedSince = now; return; }
+      if (now - endedSince < REPLAY_DELAY) return;
+      endedSince = 0;
+      try { video.currentTime = 0; } catch { /* 忽略 */ }
+      lastPlayAttempt = now;
+      const p = video.play();
+      p?.catch?.(() => { /* 稍后重试 */ });
+      return;
+    }
+    endedSince = 0;
+    if (video.paused) {
+      if (now - lastPlayAttempt < 3000) return;
+      lastPlayAttempt = now;
+      const p = video.play();
+      p?.catch?.(() => { /* 稍后重试 */ });
+    }
+  }
+
+  function safePlayVideo(progress) {
     const video = [...document.querySelectorAll('video')].find(visible);
     if (!video) return '尚未检测到 HTML 视频播放器';
     video.muted = !!settings.muted;
-    if (settings.autoplay && !startedVideos.has(video)) {
-      const p = video.play();
-      if (p?.then) {
-        p.then(() => startedVideos.add(video)).catch(() => {
-          // 浏览器可能在媒体尚未就绪时拒绝播放；后续页面更新时再尝试。
-        });
-      } else {
-        startedVideos.add(video);
-      }
-    }
     applyPlaybackRate(video);
+    if (settings.autoplay && (progress === null || progress < 100)) {
+      keepVideoPlaying(video);
+    }
     const rateNote = Math.abs(video.playbackRate - 1) > 1e-6 ? `，${video.playbackRate}倍速` : '';
-    return `已应用播放设置（${settings.muted ? '静音' : '有声'}${rateNote}）`;
+    const stateNote = video.paused ? '，当前暂停' : '，播放中';
+    return `已应用播放设置（${settings.muted ? '静音' : '有声'}${rateNote}${stateNote}）`;
   }
 
   const panel = document.createElement('section');
@@ -183,7 +202,7 @@
   const style = document.createElement('style');
   style.textContent = `
     #ccb-helper-panel{position:fixed;z-index:2147483647;right:18px;top:110px;width:290px;background:#fff;color:#222;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 5px 22px #0003;font:14px/1.45 system-ui,sans-serif}
-    #ccb-helper-panel header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#eff6ff;border-radius:10px 10px 0 0}
+    #ccb-helper-panel header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#eff6ff;border-radius:10px 10px 0 0;cursor:move;user-select:none;touch-action:none}
     #ccb-helper-panel button{cursor:pointer;border:1px solid #cbd5e1;border-radius:6px;background:#fff;padding:4px 9px}
     #ccb-helper-panel .body{padding:10px 12px;display:grid;gap:8px}
     #ccb-helper-panel label{display:flex;gap:7px;align-items:center}
@@ -217,6 +236,7 @@
     settings.minimized = !settings.minimized;
     panel.classList.toggle('min', settings.minimized);
     save();
+    setTimeout(clampPanel, 0);
   });
   panel.classList.toggle('min', settings.minimized);
 
@@ -244,6 +264,67 @@
   });
   refreshForce3UI();
 
+  // ---- 面板拖拽 ----
+  const headerEl = panel.querySelector('header');
+  let dragging = false;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+
+  function clampPanel() {
+    if (!panel.style.left) return;
+    const maxX = Math.max(0, window.innerWidth - panel.offsetWidth);
+    const maxY = Math.max(0, window.innerHeight - panel.offsetHeight);
+    const x = Math.max(0, Math.min(maxX, parseFloat(panel.style.left) || 0));
+    const y = Math.max(0, Math.min(maxY, parseFloat(panel.style.top) || 0));
+    panel.style.left = x + 'px';
+    panel.style.top = y + 'px';
+  }
+
+  if (settings.panelPos
+    && Number.isFinite(settings.panelPos.left)
+    && Number.isFinite(settings.panelPos.top)) {
+    panel.style.left = settings.panelPos.left + 'px';
+    panel.style.top = settings.panelPos.top + 'px';
+    panel.style.right = 'auto';
+    clampPanel();
+  }
+
+  headerEl.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    const rect = panel.getBoundingClientRect();
+    dragging = true;
+    dragOffsetX = e.clientX - rect.left;
+    dragOffsetY = e.clientY - rect.top;
+    panel.style.left = rect.left + 'px';
+    panel.style.top = rect.top + 'px';
+    panel.style.right = 'auto';
+    try { headerEl.setPointerCapture(e.pointerId); } catch { /* 忽略 */ }
+    e.preventDefault();
+  });
+
+  headerEl.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const maxX = Math.max(0, window.innerWidth - panel.offsetWidth);
+    const maxY = Math.max(0, window.innerHeight - panel.offsetHeight);
+    const x = Math.max(0, Math.min(maxX, e.clientX - dragOffsetX));
+    const y = Math.max(0, Math.min(maxY, e.clientY - dragOffsetY));
+    panel.style.left = x + 'px';
+    panel.style.top = y + 'px';
+  });
+
+  function endDrag(e) {
+    if (!dragging) return;
+    dragging = false;
+    try { headerEl.releasePointerCapture(e.pointerId); } catch { /* 忽略 */ }
+    const rect = panel.getBoundingClientRect();
+    settings.panelPos = { left: Math.round(rect.left), top: Math.round(rect.top) };
+    save();
+  }
+
+  headerEl.addEventListener('pointerup', endDrag);
+  headerEl.addEventListener('pointercancel', endDrag);
+  window.addEventListener('resize', clampPanel);
+
   function addButton(actions, label, fn) {
     const b = document.createElement('button'); b.textContent = label; b.addEventListener('click', fn); actions.append(b);
   }
@@ -254,7 +335,7 @@
     actions.replaceChildren();
     if (isVideoPage()) {
       const p = findProgress();
-      const playResult = safePlayVideo();
+      const playResult = safePlayVideo(p);
       status.textContent = `视频页面：${p === null ? '未识别到进度' : `页面进度 ${p}%`}；${playResult}`;
       if (p === 100) {
         status.textContent += '。该视频显示已完成，可返回专题班详情核对其余课程。';
@@ -266,6 +347,8 @@
           const target = workshopDetailUrl();
           if (target) autoNavigateOnce(location.hash, target);
         }
+      } else if (settings.autoplay) {
+        status.textContent += '；进度未满 100%，已保持自动播放。';
       }
       return;
     }
