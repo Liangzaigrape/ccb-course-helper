@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.6.8
-// @description  扫描全部分页并逐个学习；保留当前播放课程并清理其他课程详情页。
+// @version      1.6.9
+// @description  扫描全部分页并逐个学习；清理其他课程及同课程中过多的旧详情页。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
 // @run-at       document-idle
@@ -22,6 +22,9 @@
   const BATCH_DONE_PREFIX = 'ccbCourseHelperSingleBatchDone';
   const ACTIVE_WORKSHOP_KEY = 'ccbCourseHelperActiveWorkshop';
   const SUPPRESSED_TAB_KEY = 'ccbCourseHelperSuppressedAfterClose';
+  const DETAIL_TAB_PREFIX = 'ccbCourseHelperDetailTab:';
+  const DETAIL_TAB_ID_KEY = 'ccbCourseHelperDetailTabId';
+  const DETAIL_TAB_ORIGIN_KEY = 'ccbCourseHelperDetailTabOrigin';
   const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, forced3: false, minimized: false };
   const settings = { ...defaults, ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}) };
   let isRunning = typeof GM_getValue === 'function' ? GM_getValue(RUN_KEY, true) !== false : true;
@@ -40,6 +43,10 @@
   let wakeLockPending = false;
   let wakeLockFailed = false;
   const autoClicked = new Set();
+  let detailTabId = '';
+  let detailTabCourseId = '';
+  let detailTabOpenedAt = 0;
+  let detailTabLastWrite = 0;
   const save = () => typeof GM_setValue === 'function' && GM_setValue(KEY, settings);
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
@@ -131,7 +138,7 @@
       state.nextRetryAt = 0;
       state.lastError = '';
       state.waitingSince = 0;
-      claimActiveWorkshop();
+      claimActiveWorkshop(true);
     });
     video.addEventListener('waiting', () => {
       if (!state.waitingSince) state.waitingSince = Date.now();
@@ -403,17 +410,92 @@
     return params.get('id') || params.get('workshopId') || '';
   }
 
-  function claimActiveWorkshop() {
+  function registerCurrentDetailTab(newVideoStarted = false) {
+    const courseId = getWorkshopCourseId();
+    if (!courseId || (!isWorkshopDetailPage() && !isVideoPage())) return null;
+    try {
+      const originId = String(performance.timeOrigin || 0);
+      let savedId = sessionStorage.getItem(DETAIL_TAB_ID_KEY) || '';
+      const savedOrigin = sessionStorage.getItem(DETAIL_TAB_ORIGIN_KEY) || '';
+      if (!savedId || savedOrigin !== originId) {
+        savedId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        sessionStorage.setItem(DETAIL_TAB_ID_KEY, savedId);
+        sessionStorage.setItem(DETAIL_TAB_ORIGIN_KEY, originId);
+        detailTabOpenedAt = Date.now();
+      }
+      if (detailTabId !== savedId || detailTabCourseId !== courseId) {
+        detailTabId = savedId;
+        detailTabCourseId = courseId;
+        detailTabOpenedAt = Date.now();
+        detailTabLastWrite = 0;
+      }
+      if (newVideoStarted) detailTabOpenedAt = Date.now();
+      const now = Date.now();
+      if (newVideoStarted || now - detailTabLastWrite >= 10000) {
+        localStorage.setItem(`${DETAIL_TAB_PREFIX}${detailTabId}`, JSON.stringify({
+          tabId: detailTabId, courseId, openedAt: detailTabOpenedAt, lastSeen: now,
+        }));
+        detailTabLastWrite = now;
+      }
+      return { tabId: detailTabId, courseId, openedAt: detailTabOpenedAt };
+    } catch {
+      return null;
+    }
+  }
+
+  function countCourseDetailTabs(courseId) {
+    const tabs = [];
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (!key?.startsWith(DETAIL_TAB_PREFIX)) continue;
+        let record;
+        try { record = JSON.parse(localStorage.getItem(key) || 'null'); } catch { record = null; }
+        if (!record?.tabId || !record.courseId) continue;
+        if (Date.now() - Number(record.lastSeen || 0) > 120000) {
+          localStorage.removeItem(key);
+          continue;
+        }
+        if (record.courseId === courseId) tabs.push(record);
+      }
+    } catch { /* 浏览器禁用站点存储时不做同课程标签清理 */ }
+    return tabs;
+  }
+
+  function unregisterCurrentDetailTab() {
+    if (!detailTabId) return;
+    try { localStorage.removeItem(`${DETAIL_TAB_PREFIX}${detailTabId}`); } catch { /* 忽略 */ }
+    detailTabId = '';
+    detailTabCourseId = '';
+    detailTabOpenedAt = 0;
+    detailTabLastWrite = 0;
+  }
+
+  window.addEventListener('pagehide', unregisterCurrentDetailTab);
+
+  function claimActiveWorkshop(newVideoStarted = false) {
     if (!isRunning || !settings.autoplay || document.visibilityState !== 'visible' || !document.hasFocus()
       || typeof GM_setValue !== 'function') return;
-    const courseId = getWorkshopCourseId();
-    if (!courseId) return;
+    const currentTab = registerCurrentDetailTab(newVideoStarted);
+    if (!currentTab) return;
+    const courseTabs = countCourseDetailTabs(currentTab.courseId);
+    const closeOlderCourseTabs = courseTabs.length > 3;
     const active = typeof GM_getValue === 'function' ? GM_getValue(ACTIVE_WORKSHOP_KEY, null) : null;
-    if (active?.courseId !== courseId) GM_setValue(ACTIVE_WORKSHOP_KEY, { courseId, startedAt: Date.now() });
+    if (newVideoStarted || active?.courseId !== currentTab.courseId || active?.tabId !== currentTab.tabId
+      || !!active?.closeOlderCourseTabs !== closeOlderCourseTabs) {
+      GM_setValue(ACTIVE_WORKSHOP_KEY, {
+        courseId: currentTab.courseId,
+        tabId: currentTab.tabId,
+        startedAt: Date.now(),
+        closeOlderCourseTabs,
+        keepTabId: closeOlderCourseTabs ? currentTab.tabId : '',
+      });
+    }
   }
 
   function yieldToActiveWorkshop() {
     if ((!isWorkshopDetailPage() && !isVideoPage()) || !getWorkshopCourseId()) return;
+    unregisterCurrentDetailTab();
     try { window.close(); } catch { /* 浏览器可能禁止关闭非脚本创建的标签 */ }
     setTimeout(() => {
       if (window.closed || isClassListPage()) return;
@@ -426,7 +508,12 @@
     GM_addValueChangeListener(ACTIVE_WORKSHOP_KEY, (_name, _oldValue, value) => {
       if (!value?.courseId || isClassListPage()) return;
       const thisCourseId = getWorkshopCourseId();
-      if (thisCourseId && thisCourseId !== value.courseId) yieldToActiveWorkshop();
+      if (!thisCourseId) return;
+      const thisTab = registerCurrentDetailTab();
+      const otherCourse = thisCourseId !== value.courseId;
+      const olderTabOfSameCourse = thisCourseId === value.courseId && value.closeOlderCourseTabs
+        && thisTab?.tabId !== value.keepTabId;
+      if (otherCourse || olderTabOfSameCourse) yieldToActiveWorkshop();
     });
   }
 
@@ -614,7 +701,7 @@
     if (!video) return '尚未检测到 HTML 视频播放器';
     video.muted = !!settings.muted;
     applyPlaybackRate(video);
-    if (!video.paused && (progress === null || progress < 100)) claimActiveWorkshop();
+    if (!video.paused && (progress === null || progress < 100)) claimActiveWorkshop(false);
     if (settings.autoplay && (progress === null || progress < 100)) {
       keepVideoPlaying(video);
     }
@@ -803,6 +890,7 @@
 
   function update() {
     rememberWorkshopReturnUrl();
+    registerCurrentDetailTab();
     const status = panel.querySelector('.status');
     const actions = panel.querySelector('.actions');
     actions.replaceChildren();
