@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.6.4
-// @description  扫描专题班全部分页并逐个完成未完成课程；运行时请求保持屏幕唤醒。
+// @version      1.6.8
+// @description  扫描全部分页并逐个学习；保留当前播放课程并清理其他课程详情页。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
 // @run-at       document-idle
@@ -20,6 +20,8 @@
   const AUTO_CHILD_KEY = 'ccbCourseHelperSingleAutoChild';
   const WORKSHOP_RETURN_KEY = 'ccbCourseHelperSingleWorkshopReturn';
   const BATCH_DONE_PREFIX = 'ccbCourseHelperSingleBatchDone';
+  const ACTIVE_WORKSHOP_KEY = 'ccbCourseHelperActiveWorkshop';
+  const SUPPRESSED_TAB_KEY = 'ccbCourseHelperSuppressedAfterClose';
   const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, forced3: false, minimized: false };
   const settings = { ...defaults, ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}) };
   let isRunning = typeof GM_getValue === 'function' ? GM_getValue(RUN_KEY, true) !== false : true;
@@ -117,6 +119,41 @@
 
   const visibleVideo = () => [...document.querySelectorAll('video')].find(visible);
   const targetRate = () => (settings.forced3 ? 3 : (settings.auto2x ? 2 : 0));
+  const videoRecoveryStates = new WeakMap();
+
+  function getVideoRecoveryState(video) {
+    let state = videoRecoveryStates.get(video);
+    if (state) return state;
+    state = { retries: 0, nextRetryAt: 0, lastError: '', waitingSince: 0 };
+    videoRecoveryStates.set(video, state);
+    video.addEventListener('playing', () => {
+      state.retries = 0;
+      state.nextRetryAt = 0;
+      state.lastError = '';
+      state.waitingSince = 0;
+      claimActiveWorkshop();
+    });
+    video.addEventListener('waiting', () => {
+      if (!state.waitingSince) state.waitingSince = Date.now();
+    });
+    video.addEventListener('canplay', () => { state.waitingSince = 0; });
+    video.addEventListener('error', () => {
+      const code = video.error?.code;
+      state.lastError = code ? `媒体错误 ${code}` : '播放器媒体错误';
+    });
+    video.addEventListener('pause', () => {
+      if (!isRunning || !settings.autoplay || video.ended || !visible(video) || state.pauseRecoveryTimer) return;
+      state.nextRetryAt = 0;
+      state.pauseRecoveryTimer = setTimeout(() => {
+        state.pauseRecoveryTimer = null;
+        if (!isRunning || !settings.autoplay || !video.paused || video.ended || video.error || !visible(video)) return;
+        const progress = findProgress();
+        if (progress === 100) return;
+        keepVideoPlaying(video);
+      }, 1200);
+    });
+    return state;
+  }
 
   function applyPlaybackRate(video) {
     const v = video || visibleVideo();
@@ -339,6 +376,60 @@
     return /^#\/myworkshop(?:\?.*)?$/.test(location.hash);
   }
 
+  function isWorkshopDetailPage() {
+    return location.pathname.replace(/\/$/, '') === '/workshop'
+      && /^#\/myworkshop\/detail(?:\?.*)?$/.test(location.hash);
+  }
+
+  function rememberWorkshopReturnUrl() {
+    if (!isWorkshopDetailPage()) return;
+    try {
+      const params = new URLSearchParams(location.hash.split('?')[1] || '');
+      params.delete('ccbAuto');
+      const route = location.hash.split('?')[0];
+      const query = params.toString();
+      sessionStorage.setItem(WORKSHOP_RETURN_KEY, `${location.origin}${location.pathname}${route}${query ? `?${query}` : ''}`);
+    } catch { /* 忽略 */ }
+  }
+  window.addEventListener('hashchange', rememberWorkshopReturnUrl);
+
+  function getWorkshopCourseId() {
+    let source = location.href;
+    if (!isWorkshopDetailPage() && isVideoPage()) {
+      try { source = sessionStorage.getItem(WORKSHOP_RETURN_KEY) || source; } catch { /* 忽略 */ }
+    }
+    const query = source.split('#')[1]?.split('?')[1] || '';
+    const params = new URLSearchParams(query);
+    return params.get('id') || params.get('workshopId') || '';
+  }
+
+  function claimActiveWorkshop() {
+    if (!isRunning || !settings.autoplay || document.visibilityState !== 'visible' || !document.hasFocus()
+      || typeof GM_setValue !== 'function') return;
+    const courseId = getWorkshopCourseId();
+    if (!courseId) return;
+    const active = typeof GM_getValue === 'function' ? GM_getValue(ACTIVE_WORKSHOP_KEY, null) : null;
+    if (active?.courseId !== courseId) GM_setValue(ACTIVE_WORKSHOP_KEY, { courseId, startedAt: Date.now() });
+  }
+
+  function yieldToActiveWorkshop() {
+    if ((!isWorkshopDetailPage() && !isVideoPage()) || !getWorkshopCourseId()) return;
+    try { window.close(); } catch { /* 浏览器可能禁止关闭非脚本创建的标签 */ }
+    setTimeout(() => {
+      if (window.closed || isClassListPage()) return;
+      try { sessionStorage.setItem(SUPPRESSED_TAB_KEY, '1'); } catch { /* 忽略 */ }
+      location.assign('https://u.ccb.com/workshop/#/myworkshop');
+    }, 400);
+  }
+
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener(ACTIVE_WORKSHOP_KEY, (_name, _oldValue, value) => {
+      if (!value?.courseId || isClassListPage()) return;
+      const thisCourseId = getWorkshopCourseId();
+      if (thisCourseId && thisCourseId !== value.courseId) yieldToActiveWorkshop();
+    });
+  }
+
   function findAction(label) {
     return [...document.querySelectorAll('a,button,[role="button"],.edit-block')]
       .find(el => visible(el) && textOf(el).includes(label));
@@ -385,6 +476,11 @@
         const record = { tab, workerId, doneKey: `${BATCH_DONE_PREFIX}:${batchId}:${workerId}`, closed: false };
         if (tab) tab.onclose = () => { record.closed = true; };
         managedTabs.push(record);
+        if (typeof GM_addValueChangeListener === 'function') {
+          record.doneListenerId = GM_addValueChangeListener(record.doneKey, (_name, _oldValue, value) => {
+            if (value === true && isClassListPage()) scheduleBatchReturn();
+          });
+        }
         return true;
       }
       const tab = window.open(target, '_blank');
@@ -401,6 +497,27 @@
     try { return record.tab?.closed !== true; } catch { return false; }
   }
 
+  function scheduleBatchReturn() {
+    if (batchReloadScheduled) return;
+    batchReloadScheduled = true;
+    const status = panel?.querySelector('.status');
+    if (status) status.textContent = '已确认一个专题班内的视频全部完成；5 秒后返回列表重新检索未完成课程…';
+    setTimeout(() => {
+      if (!isRunning) {
+        batchReloadScheduled = false;
+        return;
+      }
+      for (const record of managedTabs) {
+        if (!isManagedTabAlive(record)) continue;
+        try {
+          if (typeof record.tab?.close === 'function') record.tab.close();
+          else record.tab?.close?.();
+        } catch { /* 忽略 */ }
+      }
+      location.assign('https://u.ccb.com/workshop/#/myworkshop');
+    }, 5000);
+  }
+
   function openDetailBatch(cards) {
     const urls = [];
     for (const card of cards) {
@@ -412,13 +529,32 @@
     if (!urls.length) return 0;
     batchActive = true;
     batchStartedAt = Date.now();
-    activeBatchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    managedTabs = [];
-    // 单线程：当前专题班完成后才返回列表重新扫描并打开下一门。
-    openManagedDetail(urls[0], activeBatchId, 'worker1');
-    const opened = managedTabs.length;
-    if (!opened) batchActive = false;
-    return opened;
+    // 单标签顺序执行：直接在当前标签打开课程，避免依赖跨标签完成信号。
+    location.assign(urls[0]);
+    return 1;
+  }
+
+  function returnToWorkshopListAfterDelay() {
+    if (batchReloadScheduled) return;
+    batchReloadScheduled = true;
+    setTimeout(() => {
+      if (!isRunning) {
+        batchReloadScheduled = false;
+        return;
+      }
+      batchActive = false;
+      batchReloadScheduled = false;
+      managedTabs = [];
+      paginationScan = null;
+      allDoneSince = 0;
+      activeBatchId = '';
+      childDoneReported = false;
+      childBatchId = '';
+      childWorkerId = '';
+      autoClicked.clear();
+      try { sessionStorage.removeItem(AUTO_CHILD_KEY); } catch { /* 忽略 */ }
+      location.assign('https://u.ccb.com/workshop/#/myworkshop');
+    }, 5000);
   }
 
   function reportManagedChildDone() {
@@ -442,22 +578,34 @@
 
   function keepVideoPlaying(video) {
     const now = Date.now();
+    const recovery = getVideoRecoveryState(video);
     if (video.ended) {
       if (!endedSince) { endedSince = now; return; }
       if (now - endedSince < REPLAY_DELAY) return;
       endedSince = 0;
       try { video.currentTime = 0; } catch { /* 忽略 */ }
       lastPlayAttempt = now;
-      const p = video.play();
-      p?.catch?.(() => { /* 稍后重试 */ });
+      try {
+        const p = video.play();
+        p?.catch?.(error => { recovery.lastError = `重播失败：${error?.name || '播放被拒绝'}`; });
+      } catch (error) {
+        recovery.lastError = `重播失败：${error?.name || '播放被拒绝'}`;
+      }
       return;
     }
     endedSince = 0;
-    if (video.paused) {
-      if (now - lastPlayAttempt < 3000) return;
+    if (video.paused && !video.error && now >= recovery.nextRetryAt) {
+      if (now - lastPlayAttempt < 1000) return;
       lastPlayAttempt = now;
-      const p = video.play();
-      p?.catch?.(() => { /* 稍后重试 */ });
+      const retryDelay = Math.min(3000 * (2 ** recovery.retries), 30000);
+      recovery.retries += 1;
+      recovery.nextRetryAt = now + retryDelay;
+      try {
+        const p = video.play();
+        p?.catch?.(error => { recovery.lastError = `自动恢复失败：${error?.name || '播放被拒绝'}`; });
+      } catch (error) {
+        recovery.lastError = `自动恢复失败：${error?.name || '播放被拒绝'}`;
+      }
     }
   }
 
@@ -466,11 +614,19 @@
     if (!video) return '尚未检测到 HTML 视频播放器';
     video.muted = !!settings.muted;
     applyPlaybackRate(video);
+    if (!video.paused && (progress === null || progress < 100)) claimActiveWorkshop();
     if (settings.autoplay && (progress === null || progress < 100)) {
       keepVideoPlaying(video);
     }
     const rateNote = Math.abs(video.playbackRate - 1) > 1e-6 ? `，${video.playbackRate}倍速` : '';
-    const stateNote = video.paused ? '，当前暂停' : '，播放中';
+    const recovery = getVideoRecoveryState(video);
+    const stateNote = video.error
+      ? `，${recovery.lastError || '播放器媒体错误，需刷新播放页'}`
+      : video.paused
+        ? `，已暂停，自动恢复尝试 ${recovery.retries} 次`
+        : recovery.waitingSince && Date.now() - recovery.waitingSince > 10000
+          ? '，视频正在缓冲，等待播放器恢复'
+          : '，播放中';
     return `已应用播放设置（${settings.muted ? '静音' : '有声'}${rateNote}${stateNote}）`;
   }
 
@@ -646,12 +802,25 @@
   }
 
   function update() {
+    rememberWorkshopReturnUrl();
     const status = panel.querySelector('.status');
     const actions = panel.querySelector('.actions');
     actions.replaceChildren();
     if (!isRunning) {
       status.textContent = '脚本已停止；点击“继续执行”恢复。';
       return;
+    }
+    if (isClassListPage()) {
+      let suppressed = false;
+      try { suppressed = sessionStorage.getItem(SUPPRESSED_TAB_KEY) === '1'; } catch { /* 忽略 */ }
+      if (suppressed) {
+        status.textContent = '此标签已让位给当前播放课程；需要时可恢复自动学习。';
+        addButton(actions, '恢复此标签自动学习', () => {
+          try { sessionStorage.removeItem(SUPPRESSED_TAB_KEY); } catch { /* 忽略 */ }
+          update();
+        });
+        return;
+      }
     }
     if (isVideoPage()) {
       const p = findProgress();
@@ -675,21 +844,10 @@
     const cards = getCourseCards();
     if (cards.length || isClassListPage()) {
       if (isClassListPage() && batchActive) {
-        const allFinished = managedTabs.length > 0 && managedTabs.every(record =>
-          !isManagedTabAlive(record) || (typeof GM_getValue === 'function' && GM_getValue(record.doneKey, false) === true));
-        if (allFinished && Date.now() - batchStartedAt > 1500) {
-          status.textContent = '本批详情页均已完成；正在统一关闭本批标签并重新检索未完成课程…';
-          if (!batchReloadScheduled) {
-            batchReloadScheduled = true;
-            for (const record of managedTabs) {
-              if (!isManagedTabAlive(record)) continue;
-              try {
-                if (typeof record.tab?.close === 'function') record.tab.close();
-                else record.tab?.close?.();
-              } catch { /* 忽略 */ }
-            }
-            setTimeout(() => location.reload(), 1000);
-          }
+        const anyFinished = managedTabs.some(record =>
+          typeof GM_getValue === 'function' && GM_getValue(record.doneKey, false) === true);
+        if (anyFinished && Date.now() - batchStartedAt > 1500) {
+          scheduleBatchReturn();
           return;
         }
       }
@@ -765,10 +923,11 @@
           status.textContent = '表格暂时显示全部完成，正在等待页面加载稳定后再次核对…';
         } else if (isManagedChild()) {
           reportManagedChildDone();
-          status.textContent = '本专题班已确认全部完成；保留此页，等待本批其他详情页完成后统一关闭。';
+          status.textContent = '本专题班已确认全部视频完成；5 秒后返回列表重新检索。';
+          returnToWorkshopListAfterDelay();
         } else {
-          status.textContent = '专题班内课程均显示 100%；返回专题班列表查找下一班。';
-          autoNavigateOnce(location.hash, 'https://u.ccb.com/workshop/#/myworkshop');
+          status.textContent = '专题班内课程均显示 100%；5 秒后返回列表重新检索下一门。';
+          returnToWorkshopListAfterDelay();
         }
       }
       return;
