@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.6.9
-// @description  扫描全部分页并逐个学习；清理其他课程及同课程中过多的旧详情页。
+// @version      1.7.5
+// @description  支持专题班与门户课程队列，按课时逐个学习并清理多余详情页。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
+// @match        https://u.ccb.com/portal/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,6 +26,9 @@
   const DETAIL_TAB_PREFIX = 'ccbCourseHelperDetailTab:';
   const DETAIL_TAB_ID_KEY = 'ccbCourseHelperDetailTabId';
   const DETAIL_TAB_ORIGIN_KEY = 'ccbCourseHelperDetailTabOrigin';
+  const PORTAL_QUEUE_KEY = 'ccbCourseHelperPortalQueue';
+  const PORTAL_SELECTION_KEY = 'ccbCourseHelperPortalSelection';
+  const COURSE_RETURN_KEY = 'ccbCourseHelperCourseReturn';
   const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, forced3: false, minimized: false };
   const settings = { ...defaults, ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}) };
   let isRunning = typeof GM_getValue === 'function' ? GM_getValue(RUN_KEY, true) !== false : true;
@@ -47,6 +51,7 @@
   let detailTabCourseId = '';
   let detailTabOpenedAt = 0;
   let detailTabLastWrite = 0;
+  let portalCourseDoneSince = 0;
   const save = () => typeof GM_setValue === 'function' && GM_setValue(KEY, settings);
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
@@ -379,8 +384,144 @@
     return location.pathname.replace(/\/$/, '') === '/course' && /^#\/detail\/[^?]+/.test(location.hash);
   }
 
+  function portalQueue() {
+    return typeof GM_getValue === 'function' ? GM_getValue(PORTAL_QUEUE_KEY, null) : null;
+  }
+
+  function savePortalQueue(queue) {
+    if (typeof GM_setValue === 'function') GM_setValue(PORTAL_QUEUE_KEY, queue);
+  }
+
+  function activePortalQueue() {
+    const queue = portalQueue();
+    return queue?.active && Array.isArray(queue.items) && queue.index < queue.items.length ? queue : null;
+  }
+
+  function advancePortalQueue(queue) {
+    const nextQueue = { ...queue, index: queue.index + 1, stalledSince: 0, currentLesson: '' };
+    if (nextQueue.index >= nextQueue.items.length) {
+      savePortalQueue({ ...nextQueue, active: false, completed: true });
+      return null;
+    }
+    savePortalQueue(nextQueue);
+    return nextQueue.items[nextQueue.index];
+  }
+
+  function portalStallDuration(queue) {
+    const video = visibleVideo();
+    if (video && !video.paused && !video.ended && !video.error) {
+      if (queue.stalledSince) savePortalQueue({ ...queue, stalledSince: 0 });
+      return 0;
+    }
+    const since = Number(queue.stalledSince) || Date.now();
+    if (!queue.stalledSince) savePortalQueue({ ...queue, stalledSince: since });
+    return Date.now() - since;
+  }
+
+  function skipStalledPortalCourse(queue, status) {
+    const item = queue.items[queue.index];
+    const next = advancePortalQueue(queue);
+    if (next) {
+      status.textContent = `“${item.title}”连续 15 秒没有播放视频，已超时跳过；正在进入下一门“${next.title}”。`;
+      location.href = next.url;
+    } else {
+      status.textContent = `“${item.title}”连续 15 秒没有播放视频，已超时跳过；队列中没有其他课程。`;
+    }
+  }
+
+  function markPortalLessonComplete(queue) {
+    const current = queue?.currentLesson;
+    const item = queue?.items?.[queue.index];
+    if (!current || !item) return;
+    const finishedLessons = { ...(queue.finishedLessons || {}) };
+    const names = new Set(finishedLessons[item.id] || []);
+    names.add(current);
+    finishedLessons[item.id] = [...names];
+    savePortalQueue({ ...queue, finishedLessons, currentLesson: '' });
+  }
+
+  function portalCourseIsComplete(course) {
+    return course.progress === 100 || course.completed === true;
+  }
+
+  function portalCourseTotalProgress() {
+    const progressRoot = document.querySelector('.progress-v');
+    if (!progressRoot) return null;
+    const nested = findProgress(progressRoot);
+    if (nested !== null) return nested;
+    const match = textOf(progressRoot).match(progressRe);
+    return match ? Number(match[1]) : null;
+  }
+
+  function courseDetailId(url = location.href) {
+    const match = String(url).match(/\/course\/#\/detail\/([^?&#]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  function rememberCourseDetailReturnUrl() {
+    if (!isCourseDetailPage()) return;
+    try { sessionStorage.setItem(COURSE_RETURN_KEY, location.href.split('&ccb')[0]); } catch { /* 忽略 */ }
+  }
+
+  function courseDetailReturnUrl() {
+    try {
+      const saved = sessionStorage.getItem(COURSE_RETURN_KEY);
+      if (saved) return saved;
+    } catch { /* 忽略 */ }
+    const queue = activePortalQueue();
+    return queue?.items?.[queue.index]?.url || null;
+  }
+
+  function portalCourseSections() {
+    const wanted = ['党的理论教育', '党性教育', '履职能力'];
+    const sections = [];
+    for (const module of document.querySelectorAll('.cuWeb-linkModule')) {
+      const heading = textOf(module.querySelector('.cuWeb-listheader-web-title'));
+      const section = wanted.find(name => heading.includes(name));
+      if (!section) continue;
+      const courses = [];
+      const seen = new Set();
+      for (const card of module.querySelectorAll('.cuWeb-linkModule-style2[data-link]')) {
+        const title = textOf(card.querySelector('h3'));
+        const raw = card.getAttribute('data-link') || '';
+        let url;
+        try { url = new URL(raw, location.origin).href; } catch { continue; }
+        if (!title || !/^https:\/\/u\.ccb\.com\/course\/#\/detail\/[^?&#]+/.test(url) || seen.has(url)) continue;
+        seen.add(url);
+        const progress = findProgress(card);
+        courses.push({ section, title, url, id: courseDetailId(url), progress,
+          completed: completedStatusRe.test(textOf(card)) });
+      }
+      if (courses.length) sections.push({ name: section, courses });
+    }
+    return sections;
+  }
+
+  function portalCourseLessons() {
+    return [...document.querySelectorAll('.catalog-sec-item')].map(row => {
+      const title = textOf(row.querySelector('.lesson-index')) || textOf(row);
+      const labels = [...row.querySelectorAll('[aria-label],[title]')]
+        .map(el => `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`).join(' ');
+      const hasCheckClass = [...row.querySelectorAll('[class]')].some(el =>
+        [...el.classList].some(name => !/uncheck/i.test(name)
+          && /(^|[-_])(check|checked|checkmark)(?:$|[-_])/i.test(name)));
+      const checked = /[✔✓√]/.test(textOf(row)) || /已完成|已学完/.test(labels) || hasCheckClass;
+      return { row, title, locked: row.classList.contains('disable'), checked };
+    }).filter(item => item.title);
+  }
+
+  function startPortalLesson(queue, lesson) {
+    savePortalQueue({ ...queue, currentLesson: lesson.title });
+    const action = lesson.row.querySelector('a,button,[role="button"]');
+    if (action) action.click(); else lesson.row.click();
+  }
+
   function isClassListPage() {
     return /^#\/myworkshop(?:\?.*)?$/.test(location.hash);
+  }
+
+  function isPortalStudyPage() {
+    return location.pathname.replace(/\/$/, '') === '/portal' && /^#\/study(?:\?.*)?$/.test(location.hash);
   }
 
   function isWorkshopDetailPage() {
@@ -869,10 +1010,14 @@
   function setRunning(next) {
     isRunning = !!next;
     const toggle = panel.querySelector('[data-act="run-toggle"]');
-    toggle.textContent = isRunning ? '停止执行' : '继续执行';
-    toggle.title = isRunning ? '停止所有脚本标签页的自动处理' : '继续所有脚本标签页的自动处理';
+    const pausedQueue = !isRunning && !!activePortalQueue();
+    toggle.textContent = isRunning ? '停止执行' : pausedQueue ? '选择恢复方式' : '继续执行';
+    toggle.title = isRunning ? '停止所有脚本标签页的自动处理'
+      : pausedQueue ? '选择继续上次课程任务或重新选择课程' : '继续所有脚本标签页的自动处理';
     if (!isRunning) {
       releaseScreenWakeLock();
+      const queue = activePortalQueue();
+      if (queue?.stalledSince) savePortalQueue({ ...queue, stalledSince: 0 });
       for (const video of document.querySelectorAll('video')) video.pause();
     } else {
       requestScreenWakeLock();
@@ -880,6 +1025,7 @@
     update();
   }
   panel.querySelector('[data-act="run-toggle"]').addEventListener('click', () => {
+    if (!isRunning && activePortalQueue()) { update(); return; }
     const next = !isRunning;
     if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, next);
     setRunning(next);
@@ -890,12 +1036,35 @@
 
   function update() {
     rememberWorkshopReturnUrl();
+    rememberCourseDetailReturnUrl();
     registerCurrentDetailTab();
     const status = panel.querySelector('.status');
     const actions = panel.querySelector('.actions');
     actions.replaceChildren();
     if (!isRunning) {
-      status.textContent = '脚本已停止；点击“继续执行”恢复。';
+      const queue = activePortalQueue();
+      const toggle = panel.querySelector('[data-act="run-toggle"]');
+      if (queue) {
+        status.textContent = `课程任务已暂停，当前为第 ${queue.index + 1}/${queue.items.length} 门：${queue.items[queue.index]?.title || '课程'}。请选择如何继续。`;
+        toggle.textContent = '选择恢复方式';
+        toggle.title = '在下方选择继续上次任务或重新选择课程';
+        addButton(actions, '继续上次课程任务', () => {
+          if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, true);
+          setRunning(true);
+        });
+        addButton(actions, '重新选择课程', () => {
+          savePortalQueue({ ...queue, active: false, completed: false, currentLesson: '' });
+          if (typeof GM_setValue === 'function') {
+            GM_setValue(PORTAL_SELECTION_KEY, []);
+            GM_setValue(RUN_KEY, true);
+          }
+          setRunning(true);
+          location.assign('https://u.ccb.com/portal/#/study?microPageId=1565348618942312449');
+        });
+      } else {
+        status.textContent = '脚本已停止；点击“继续执行”恢复。';
+        toggle.textContent = '继续执行';
+      }
       return;
     }
     if (isClassListPage()) {
@@ -915,18 +1084,96 @@
       const playResult = safePlayVideo(p);
       status.textContent = `视频页面：${p === null ? '未识别到进度' : `页面进度 ${p}%`}；${playResult}`;
       if (p === 100) {
-        status.textContent += '。该视频显示已完成，可返回专题班详情核对其余课程。';
-        addButton(actions, '返回详情', () => {
-          const back = document.querySelector('.player_area .return-btn');
-          if (back) back.click(); else history.back();
-        });
-        if (settings.autoOpen) {
-          const target = workshopDetailUrl();
-          if (target) autoNavigateOnce(location.hash, target);
+        const queue = activePortalQueue();
+        if (queue) {
+          markPortalLessonComplete(queue);
+          const target = courseDetailReturnUrl() || queue.items[queue.index]?.url;
+          status.textContent = '当前课时已完成，正在返回课程目录核对并开始下一课时…';
+          if (target) autoNavigateOnce(`portal-course:${queue.index}:${location.hash}`, target);
+        } else {
+          status.textContent += '。该视频显示已完成，可返回专题班详情核对其余课程。';
+          addButton(actions, '返回详情', () => {
+            const back = document.querySelector('.player_area .return-btn');
+            if (back) back.click(); else history.back();
+          });
+          if (settings.autoOpen) {
+            const target = workshopDetailUrl();
+            if (target) autoNavigateOnce(location.hash, target);
+          }
+        }
+      } else if (activePortalQueue()) {
+        const queue = activePortalQueue();
+        const stalledFor = portalStallDuration(queue);
+        if (stalledFor >= 15000) {
+          skipStalledPortalCourse(queue, status);
+        } else {
+          status.textContent += `；未检测到正在播放的视频，等待恢复中（${Math.floor(stalledFor / 1000)}/15 秒）`;
         }
       } else if (settings.autoplay) {
         status.textContent += '；进度未满 100%，已保持自动播放。';
       }
+      return;
+    }
+    if (isPortalStudyPage()) {
+      const sections = portalCourseSections();
+      const queued = activePortalQueue();
+      if (queued) {
+        const item = queued.items[queued.index];
+        status.textContent = `已选择 ${queued.items.length} 门课程；正在进入第 ${queued.index + 1} 门：${item.title}`;
+        if (settings.autoOpen) location.href = item.url;
+        else addButton(actions, '进入当前课程', () => { location.href = item.url; });
+        return;
+      }
+      status.textContent = sections.length
+        ? `读取到 ${sections.reduce((n, s) => n + s.courses.length, 0)} 门视频课程；勾选课程后点击“开始执行选中课程”。`
+        : '正在读取“党的理论教育”“党性教育”“履职能力”中的课程…';
+      const selected = new Set(typeof GM_getValue === 'function' ? GM_getValue(PORTAL_SELECTION_KEY, []) : []);
+      for (const section of sections) {
+        const heading = document.createElement('div');
+        heading.className = 'course';
+        const label = document.createElement('strong'); label.textContent = section.name;
+        const all = document.createElement('button'); all.textContent = '全选';
+        all.addEventListener('click', () => {
+          for (const course of section.courses) selected.add(course.url);
+          GM_setValue(PORTAL_SELECTION_KEY, [...selected]); update();
+        });
+        const none = document.createElement('button'); none.textContent = '全不选';
+        none.addEventListener('click', () => {
+          for (const course of section.courses) selected.delete(course.url);
+          GM_setValue(PORTAL_SELECTION_KEY, [...selected]); update();
+        });
+        heading.append(label, all, none); actions.append(heading);
+        for (const course of section.courses) {
+          const row = document.createElement('label'); row.className = 'course';
+          const checkbox = document.createElement('input'); checkbox.type = 'checkbox';
+          const completed = portalCourseIsComplete(course);
+          checkbox.checked = selected.has(course.url) && !completed;
+          checkbox.disabled = completed;
+          checkbox.addEventListener('change', () => {
+            if (checkbox.checked) selected.add(course.url); else selected.delete(course.url);
+            GM_setValue(PORTAL_SELECTION_KEY, [...selected]);
+          });
+          const title = document.createElement('span');
+          const progressLabel = completed ? (course.progress === 100 ? '已完成 100%' : '已完成') : course.progress === null
+            ? '总进度未显示' : `总进度 ${course.progress}%`;
+          title.textContent = `${course.title} · ${progressLabel}`;
+          row.append(checkbox, title); actions.append(row);
+        }
+      }
+      const start = document.createElement('button'); start.textContent = '开始执行选中课程';
+      start.disabled = !sections.some(section => section.courses.some(course => selected.has(course.url) && !portalCourseIsComplete(course)));
+      start.addEventListener('click', () => {
+        const items = sections.flatMap(section => section.courses).filter(course => selected.has(course.url) && !portalCourseIsComplete(course));
+        if (!items.length) {
+          status.textContent = '勾选的课程均已完成或总进度显示 100%，没有需要处理的课程。';
+          return;
+        }
+        savePortalQueue({ active: true, items, index: 0, startedAt: Date.now() });
+        if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, true);
+        setRunning(true);
+        location.href = items[0].url;
+      });
+      actions.append(start);
       return;
     }
     const cards = getCourseCards();
@@ -1021,6 +1268,90 @@
       return;
     }
     if (isCourseDetailPage()) {
+      const savedQueue = portalQueue();
+      if (savedQueue?.completed && savedQueue.items?.[savedQueue.items.length - 1]?.id === courseDetailId()) {
+        status.textContent = '已选课程队列全部完成。';
+        return;
+      }
+      const queue = activePortalQueue();
+      if (queue) {
+        const item = queue.items[queue.index];
+        if (courseDetailId() !== item.id) {
+          status.textContent = `课程队列正在处理“${item.title}”；正在打开该课程详情。`;
+          if (settings.autoOpen) location.href = item.url;
+          return;
+        }
+        const finished = new Set(queue.finishedLessons?.[item.id] || []);
+        const lessons = portalCourseLessons().map(lesson => ({
+          ...lesson,
+          complete: lesson.checked || finished.has(lesson.title),
+        }));
+        if (!lessons.length) {
+          const totalProgress = portalCourseTotalProgress();
+          if (totalProgress === 100) {
+            const next = advancePortalQueue(queue);
+            if (next) {
+              status.textContent = `单视频课程“${item.title}”总进度为 100%，已完成；正在进入下一门“${next.title}”。`;
+              location.href = next.url;
+            } else {
+              savePortalQueue({ ...queue, active: false, completed: true, index: queue.index + 1 });
+              status.textContent = `单视频课程“${item.title}”总进度为 100%；已选课程全部完成。`;
+            }
+            return;
+          }
+          const start = document.querySelector('button.to-learn')
+            || findAction('继续学习') || findAction('我要学习') || findAction('开始学习');
+          const stalledFor = portalStallDuration(queue);
+          if (stalledFor >= 15000) {
+            skipStalledPortalCourse(queue, status);
+          } else if (start && visible(start)) {
+            status.textContent = `单视频课程“${item.title}”：总进度 ${totalProgress === null ? '暂不可读' : `${totalProgress}%`}；正在启动视频。`;
+            autoClickOnce(start);
+          } else {
+            status.textContent = `单视频课程“${item.title}”：总进度 ${totalProgress === null ? '暂不可读' : `${totalProgress}%`}；未检测到课时目录或播放入口，等待最多 15 秒后继续队列（${Math.floor(stalledFor / 1000)}/15 秒）。`;
+          }
+          return;
+        }
+        const allDone = lessons.length > 0 && lessons.every(lesson => lesson.checked);
+        const nextLesson = lessons.find(lesson => !lesson.locked && !lesson.complete);
+        status.textContent = `课程“${item.title}”：目录识别到 ${lessons.length} 个课时${nextLesson ? `；准备学习${nextLesson.title}` : ''}。`;
+        if (allDone) {
+          if (!portalCourseDoneSince) portalCourseDoneSince = Date.now();
+          const remain = Math.max(0, 5000 - (Date.now() - portalCourseDoneSince));
+          status.textContent = `课程“${item.title}”目录中的全部课时均已出现完成勾号；${Math.ceil(remain / 1000)} 秒后切换到下一门。`;
+          if (!remain) {
+            portalCourseDoneSince = 0;
+            const next = advancePortalQueue(queue);
+            if (!next) {
+              status.textContent = '已选课程全部完成。';
+            } else {
+              location.href = next.url;
+            }
+          }
+        } else {
+          portalCourseDoneSince = 0;
+          const stalledFor = portalStallDuration(queue);
+          if (stalledFor >= 15000) {
+            skipStalledPortalCourse(queue, status);
+            return;
+          }
+          if (nextLesson) {
+            addButton(actions, `学习${nextLesson.title}`, () => {
+              startPortalLesson(queue, nextLesson);
+            });
+            if (settings.autoOpen) {
+              const clickKey = `${location.pathname}${location.hash}:${nextLesson.title}`;
+              if (!autoClicked.has(clickKey)) {
+                autoClicked.add(clickKey);
+                startPortalLesson(queue, nextLesson);
+              }
+            }
+          } else {
+            status.textContent += `；当前没有可学习的未完成课时，等待平台更新（${Math.floor(stalledFor / 1000)}/15 秒）。`;
+          }
+        }
+        return;
+      }
       const continueButton = document.querySelector('button.to-learn') || findAction('继续学习');
       const p = findProgress();
       status.textContent = `课程详情页：${p === null ? '未识别到课程进度' : `平台进度 ${p}%`}${continueButton ? '；可继续学习' : ''}`;
