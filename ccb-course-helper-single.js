@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.7.5
+// @version      1.7.7
 // @description  支持专题班与门户课程队列，按课时逐个学习并清理多余详情页。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
@@ -500,13 +500,15 @@
   function portalCourseLessons() {
     return [...document.querySelectorAll('.catalog-sec-item')].map(row => {
       const title = textOf(row.querySelector('.lesson-index')) || textOf(row);
+      const progressText = row.querySelector('.lesson-rate')?.textContent || textOf(row);
+      const progressMatch = progressText.match(progressRe);
+      const progress = progressMatch ? Number(progressMatch[1]) : null;
       const labels = [...row.querySelectorAll('[aria-label],[title]')]
         .map(el => `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`).join(' ');
-      const hasCheckClass = [...row.querySelectorAll('[class]')].some(el =>
-        [...el.classList].some(name => !/uncheck/i.test(name)
-          && /(^|[-_])(check|checked|checkmark)(?:$|[-_])/i.test(name)));
-      const checked = /[✔✓√]/.test(textOf(row)) || /已完成|已学完/.test(labels) || hasCheckClass;
-      return { row, title, locked: row.classList.contains('disable'), checked };
+      const explicitCheck = /[✔✓√]/.test(textOf(row)) || /已完成|已学完/.test(labels);
+      // 课时行有明确百分比时，以该课时自身进度为准；不能被同一行的图标样式误判。
+      const checked = progress === null ? explicitCheck : progress >= 100;
+      return { row, title, progress, locked: row.classList.contains('disable'), checked };
     }).filter(item => item.title);
   }
 
@@ -1105,7 +1107,14 @@
         const queue = activePortalQueue();
         const stalledFor = portalStallDuration(queue);
         if (stalledFor >= 15000) {
-          skipStalledPortalCourse(queue, status);
+          if (queue.multiLesson) {
+            const target = courseDetailReturnUrl() || queue.items[queue.index]?.url;
+            savePortalQueue({ ...queue, stalledSince: 0 });
+            status.textContent = '多课时课程的视频 15 秒未播放，返回目录重新核对当前课时；不会跳过整门课程。';
+            if (target) location.assign(target);
+          } else {
+            skipStalledPortalCourse(queue, status);
+          }
         } else {
           status.textContent += `；未检测到正在播放的视频，等待恢复中（${Math.floor(stalledFor / 1000)}/15 秒）`;
         }
@@ -1273,7 +1282,7 @@
         status.textContent = '已选课程队列全部完成。';
         return;
       }
-      const queue = activePortalQueue();
+      let queue = activePortalQueue();
       if (queue) {
         const item = queue.items[queue.index];
         if (courseDetailId() !== item.id) {
@@ -1282,7 +1291,15 @@
           return;
         }
         const finished = new Set(queue.finishedLessons?.[item.id] || []);
-        const lessons = portalCourseLessons().map(lesson => ({
+        const rawLessons = portalCourseLessons();
+        if (rawLessons.length && !queue.multiLesson) {
+          queue = { ...queue, multiLesson: true, stalledSince: 0 };
+          savePortalQueue(queue);
+        } else if (!rawLessons.length && queue.multiLesson) {
+          queue = { ...queue, multiLesson: false, stalledSince: 0 };
+          savePortalQueue(queue);
+        }
+        const lessons = rawLessons.map(lesson => ({
           ...lesson,
           complete: lesson.checked || finished.has(lesson.title),
         }));
@@ -1314,7 +1331,8 @@
         }
         const allDone = lessons.length > 0 && lessons.every(lesson => lesson.checked);
         const nextLesson = lessons.find(lesson => !lesson.locked && !lesson.complete);
-        status.textContent = `课程“${item.title}”：目录识别到 ${lessons.length} 个课时${nextLesson ? `；准备学习${nextLesson.title}` : ''}。`;
+        const checkedCount = lessons.filter(lesson => lesson.checked).length;
+        status.textContent = `课程“${item.title}”：目录识别到 ${lessons.length} 个课时，${checkedCount} 个已确认完成${nextLesson ? `；准备学习${nextLesson.title}` : ''}。`;
         if (allDone) {
           if (!portalCourseDoneSince) portalCourseDoneSince = Date.now();
           const remain = Math.max(0, 5000 - (Date.now() - portalCourseDoneSince));
@@ -1332,7 +1350,15 @@
           portalCourseDoneSince = 0;
           const stalledFor = portalStallDuration(queue);
           if (stalledFor >= 15000) {
-            skipStalledPortalCourse(queue, status);
+            savePortalQueue({ ...queue, stalledSince: 0 });
+            if (nextLesson) {
+              const clickKey = `${location.pathname}${location.hash}:${nextLesson.title}`;
+              autoClicked.delete(clickKey);
+              status.textContent = `“${item.title}”仍有未完成课时；15 秒未播放，正在重试${nextLesson.title}，不会跳过整门课程。`;
+              startPortalLesson(queue, nextLesson);
+            } else {
+              status.textContent = `“${item.title}”仍有 ${lessons.length - checkedCount} 个课时未确认完成，但暂时没有可播放课时；继续等待平台解锁，不跳过课程。`;
+            }
             return;
           }
           if (nextLesson) {
