@@ -1,15 +1,17 @@
 // ==UserScript==
 // @name         建行专题班学习辅助-单线程版
 // @namespace    local.ccb.course-helper
-// @version      1.7.7
-// @description  支持专题班与门户课程队列，按课时逐个学习并清理多余详情页。
+// @version      1.8.7
+// @description  支持专题班、门户课程、有声书和培训课程的单任务及四路后台队列。
 // @match        https://u.ccb.com/workshop/*
 // @match        https://u.ccb.com/course/*
 // @match        https://u.ccb.com/portal/*
+// @match        https://u.ccb.com/sys/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
 // ==/UserScript==
 
@@ -29,6 +31,11 @@
   const PORTAL_QUEUE_KEY = 'ccbCourseHelperPortalQueue';
   const PORTAL_SELECTION_KEY = 'ccbCourseHelperPortalSelection';
   const COURSE_RETURN_KEY = 'ccbCourseHelperCourseReturn';
+  const SYS_QUEUE_KEY = 'ccbCourseHelperSysChannelQueue';
+  const SYS_SELECTION_PREFIX = 'ccbCourseHelperSysChannelSelection:';
+  const SYS_RESTART_KEY = 'ccbCourseHelperSysChannelRestart';
+  const SYS_WORKER_SESSION_KEY = 'ccbCourseHelperSysWorker';
+  const SYS_WORKER_STATE_PREFIX = 'ccbCourseHelperSysWorkerState:';
   const defaults = { autoOpen: true, autoplay: true, muted: true, auto2x: true, forced3: false, minimized: false };
   const settings = { ...defaults, ...(typeof GM_getValue === 'function' ? GM_getValue(KEY, {}) : {}) };
   let isRunning = typeof GM_getValue === 'function' ? GM_getValue(RUN_KEY, true) !== false : true;
@@ -52,6 +59,12 @@
   let detailTabOpenedAt = 0;
   let detailTabLastWrite = 0;
   let portalCourseDoneSince = 0;
+  let multiLessonPauseProbe = { key: '', since: 0 };
+  let lastRewoundPlaybackKey = '';
+  const attemptedNativeAutoplay = new WeakSet();
+  let sysChannelScan = null;
+  const sysWorkerTabs = new Map();
+  const sysWorkerListeners = new Map();
   const save = () => typeof GM_setValue === 'function' && GM_setValue(KEY, settings);
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
@@ -129,7 +142,7 @@
     }
   } catch { /* 忽略 */ }
 
-  const visibleVideo = () => [...document.querySelectorAll('video')].find(visible);
+  const visibleVideo = () => [...document.querySelectorAll('video,audio')].find(visible);
   const targetRate = () => (settings.forced3 ? 3 : (settings.auto2x ? 2 : 0));
   const videoRecoveryStates = new WeakMap();
 
@@ -183,7 +196,7 @@
   // 站点可能主动把倍速改回去，这里持续纠正（仅在本脚本设定目标倍速时生效）。
   document.addEventListener('ratechange', event => {
     const video = event.target;
-    if (video instanceof HTMLVideoElement && targetRate()) applyPlaybackRate(video);
+    if (video instanceof HTMLMediaElement && targetRate()) applyPlaybackRate(video);
   }, true);
 
   function findProgress(root = document) {
@@ -377,7 +390,8 @@
   }
 
   function isVideoPage() {
-    return /^#\/play\/[^?]+/.test(location.hash) || !!document.querySelector('.player_area video');
+    return /^#\/play\/[^?]+/.test(location.hash)
+      || [...document.querySelectorAll('video,audio')].some(visible);
   }
 
   function isCourseDetailPage() {
@@ -472,6 +486,18 @@
     return queue?.items?.[queue.index]?.url || null;
   }
 
+  function portalQueueForCurrentVideo() {
+    const queue = activePortalQueue();
+    if (!queue || !isVideoPage()) return null;
+    const params = new URLSearchParams(location.hash.split('?')[1] || '');
+    const knowledgeId = params.get('pKnowledgeId') || courseDetailId(courseDetailReturnUrl() || '');
+    return knowledgeId && knowledgeId === queue.items[queue.index]?.id ? queue : null;
+  }
+
+  function hasWorkshopTaskReturn() {
+    try { return !!sessionStorage.getItem(WORKSHOP_RETURN_KEY); } catch { return false; }
+  }
+
   function portalCourseSections() {
     const wanted = ['党的理论教育', '党性教育', '履职能力'];
     const sections = [];
@@ -524,6 +550,418 @@
 
   function isPortalStudyPage() {
     return location.pathname.replace(/\/$/, '') === '/portal' && /^#\/study(?:\?.*)?$/.test(location.hash);
+  }
+
+  function isSysChannelMorePage() {
+    return location.pathname.replace(/\/$/, '') === '/sys' && /^#\/channel\/more(?:\?.*)?$/.test(location.hash);
+  }
+
+  function sysChannelInfo() {
+    const params = new URLSearchParams(location.hash.split('?')[1] || '');
+    const mid = params.get('mid') || '';
+    const kinds = {
+      '2b483b4d-2d27-4f5a-9366-6efe50dfc32f': '有声书',
+      '45defce4-c0b2-4a34-bf40-dd2caf8b477e': '培训课程',
+    };
+    return { mid, name: kinds[mid] || '课程频道' };
+  }
+
+  function sysItemIdentity(url) {
+    const direct = courseDetailId(url);
+    if (direct) return direct;
+    try {
+      const parsed = new URL(url, location.origin);
+      const params = new URLSearchParams(parsed.hash.split('?')[1] || '');
+      for (const key of ['courseId', 'contentId', 'bookId', 'audioId', 'id', 'knowledgeId']) {
+        if (params.has(key)) return `${parsed.pathname}:${params.get(key)}`;
+      }
+      return `${parsed.pathname}:${parsed.hash.split('?')[0]}`;
+    } catch { return url; }
+  }
+
+  function normalizeSysContentUrl(raw) {
+    try {
+      const url = new URL(raw, location.href);
+      if (url.origin !== location.origin) return '';
+      const route = url.hash.split('?')[0].toLowerCase();
+      if (/channel\/more|channel\/index|\/login|\/home|\/search|\/list/.test(route)) return '';
+      if (/\/play(?:\/|$)/.test(route)) return '';
+      if (!/(detail|course|audio|book|video|lesson|play|content)/.test(route)) return '';
+      const params = new URLSearchParams(url.hash.split('?')[1] || '');
+      for (const key of [...params.keys()]) if (/^ccbSys/.test(key)) params.delete(key);
+      const hashRoute = url.hash.split('?')[0];
+      url.hash = `${hashRoute}${params.size ? `?${params}` : ''}`;
+      return url.href;
+    } catch { return ''; }
+  }
+
+  function sysElementTitle(el) {
+    const card = el.closest('li,article,[class*="item" i],[class*="card" i]') || el.parentElement || el;
+    const heading = card.querySelector('h1,h2,h3,h4,[class*="title" i],[class*="name" i]');
+    let title = textOf(heading) || textOf(el) || textOf(card);
+    title = title.split(/\n/).map(norm).find(line => line && !/^(播放|学习|查看|详情|未开始|未完成|进行中|已完成)$/.test(line)) || title;
+    return { card, title: title.slice(0, 140) };
+  }
+
+  function collectSysChannelCourses() {
+    const { mid, name } = sysChannelInfo();
+    const found = new Map();
+    const sources = [...document.querySelectorAll('a[href],[data-link],[data-url],[data-href]')];
+    for (const el of sources) {
+      if (!visible(el)) continue;
+      const raws = [el.href, el.getAttribute('data-link'), el.getAttribute('data-url'), el.getAttribute('data-href')]
+        .filter(Boolean);
+      for (const raw of raws) {
+        const url = normalizeSysContentUrl(raw);
+        const identity = url ? sysItemIdentity(url) : '';
+        if (!url || found.has(identity)) continue;
+        const { card, title } = sysElementTitle(el);
+        if (!title || title.length < 2 || /^(更多|全部|上一页|下一页|返回)$/.test(title)) continue;
+        const progress = findProgress(card);
+        found.set(identity, {
+          section: name, channelId: mid, title, url,
+          id: courseDetailId(url) || url,
+          progress,
+          completed: progress === 100
+            || [...card.querySelectorAll('*')].some(node => visible(node) && /^(已完成|已学完)$/.test(textOf(node))),
+        });
+      }
+    }
+    return [...found.values()];
+  }
+
+  function scanSysChannelPages() {
+    const { mid } = sysChannelInfo();
+    if (!sysChannelScan || sysChannelScan.mid !== mid) {
+      sysChannelScan = { mid, courses: new Map(), pages: new Set(), waitingPage: '', waitingContent: '', waitingAt: 0, done: false };
+    }
+    const token = getPaginationPageToken();
+    const pageCourses = collectSysChannelCourses();
+    const content = pageCourses.map(course => course.url).sort().join('|');
+    if (sysChannelScan.waitingAt) {
+      const changed = (token && token !== sysChannelScan.waitingPage) || content !== sysChannelScan.waitingContent;
+      if (!changed && Date.now() - sysChannelScan.waitingAt < 20000) {
+        return { state: 'scanning', pages: sysChannelScan.pages.size, courses: [...sysChannelScan.courses.values()] };
+      }
+      sysChannelScan.waitingAt = 0;
+    }
+    const fingerprint = `${token}:${content}`;
+    if (!sysChannelScan.pages.has(fingerprint)) {
+      sysChannelScan.pages.add(fingerprint);
+      for (const course of pageCourses) sysChannelScan.courses.set(course.id || course.url, course);
+    }
+    if (sysChannelScan.done) return { state: 'done', pages: sysChannelScan.pages.size, courses: [...sysChannelScan.courses.values()] };
+    const next = findPaginationNext();
+    if (next && sysChannelScan.pages.size < 100) {
+      sysChannelScan.waitingPage = token;
+      sysChannelScan.waitingContent = content;
+      sysChannelScan.waitingAt = Date.now();
+      next.click();
+      return { state: 'scanning', pages: sysChannelScan.pages.size, courses: [...sysChannelScan.courses.values()] };
+    }
+    sysChannelScan.done = true;
+    return { state: 'done', pages: sysChannelScan.pages.size, courses: [...sysChannelScan.courses.values()] };
+  }
+
+  function sysQueue() {
+    return typeof GM_getValue === 'function' ? GM_getValue(SYS_QUEUE_KEY, null) : null;
+  }
+
+  function sysChannelPageUrl(mid) {
+    const params = new URLSearchParams({
+      sId: '34b0775a-0aea-4d3a-b68f-719b152b027d',
+      mid: mid || '2b483b4d-2d27-4f5a-9366-6efe50dfc32f',
+      cid: 'd2fd30b0-61ac-400e-9a8f-5786b5607e43',
+      themeStyle: '1',
+    });
+    return `https://u.ccb.com/sys/#/channel/more?${params}`;
+  }
+
+  function resumeSysQueue() {
+    if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, true);
+    setRunning(true);
+  }
+
+  function restartSysQueue(queue) {
+    const mid = queue?.items?.[0]?.channelId || sysChannelInfo().mid;
+    const mode = queue?.mode === 'single' ? 'single' : 'parallel';
+    saveSysQueue({ ...queue, active: false, cancelled: true, cancelledAt: Date.now() });
+    for (const tab of sysWorkerTabs.values()) {
+      try { tab?.close?.(); } catch { /* 忽略 */ }
+    }
+    sysWorkerTabs.clear();
+    if (typeof GM_setValue === 'function') {
+      GM_setValue(`${SYS_SELECTION_PREFIX}${mid}`, []);
+      GM_setValue(SYS_RESTART_KEY, { mid, mode, requestedAt: Date.now() });
+      GM_setValue(RUN_KEY, true);
+    }
+    sysChannelScan = null;
+    setRunning(true);
+    location.assign(sysChannelPageUrl(mid));
+  }
+
+  function saveSysQueue(queue) {
+    if (typeof GM_setValue === 'function') GM_setValue(SYS_QUEUE_KEY, queue);
+  }
+
+  function sysWorkerStateKey(queueId, workerId) {
+    return `${SYS_WORKER_STATE_PREFIX}${queueId}:${workerId}`;
+  }
+
+  function sysWorkerContext() {
+    try {
+      const params = new URLSearchParams(location.hash.split('?')[1] || '');
+      if (params.has('ccbSysQueue')) {
+        const previous = JSON.parse(sessionStorage.getItem(SYS_WORKER_SESSION_KEY) || 'null');
+        const context = {
+          ...(previous?.queueId === params.get('ccbSysQueue') ? previous : {}),
+          queueId: params.get('ccbSysQueue'),
+          workerId: params.get('ccbSysWorker') || 'single',
+          itemIndex: Number(params.get('ccbSysItem') || 0),
+        };
+        sessionStorage.setItem(SYS_WORKER_SESSION_KEY, JSON.stringify(context));
+        return context;
+      }
+      return JSON.parse(sessionStorage.getItem(SYS_WORKER_SESSION_KEY) || 'null');
+    } catch { return null; }
+  }
+
+  function saveSysWorkerContext(context) {
+    try { sessionStorage.setItem(SYS_WORKER_SESSION_KEY, JSON.stringify(context)); } catch { /* 忽略 */ }
+  }
+
+  function addSysWorkerFlags(url, queueId, workerId, itemIndex) {
+    const hashAt = url.indexOf('#');
+    const prefix = hashAt < 0 ? url : url.slice(0, hashAt);
+    const hash = hashAt < 0 ? '' : url.slice(hashAt + 1);
+    const queryAt = hash.indexOf('?');
+    const route = queryAt < 0 ? hash : hash.slice(0, queryAt);
+    const params = new URLSearchParams(queryAt < 0 ? '' : hash.slice(queryAt + 1));
+    params.set('ccbSysQueue', queueId);
+    params.set('ccbSysWorker', workerId);
+    params.set('ccbSysItem', String(itemIndex));
+    return `${prefix}#${route}?${params}`;
+  }
+
+  function workerQueueItem(context) {
+    const queue = sysQueue();
+    if (!queue?.active || queue.id !== context?.queueId) return null;
+    const itemIndex = queue.mode === 'single' ? queue.index : context.itemIndex;
+    const item = queue.items?.[itemIndex];
+    if (!item) return null;
+    if (queue.mode === 'parallel' && queue.assignments?.[context.workerId]?.itemIndex !== itemIndex) return null;
+    return { queue, item, itemIndex };
+  }
+
+  function listenSysWorker(queueId, workerId) {
+    const listenerKey = `${queueId}:${workerId}`;
+    if (typeof GM_addValueChangeListener !== 'function' || sysWorkerListeners.has(listenerKey)) return;
+    const key = sysWorkerStateKey(queueId, workerId);
+    const listenerId = GM_addValueChangeListener(key, (_name, _oldValue, value) => {
+      if (value?.status === 'done' && value.queueId === queueId) handleSysWorkerDone(queueId, workerId, value);
+    });
+    sysWorkerListeners.set(listenerKey, listenerId);
+  }
+
+  function readCurrentCourseProgress() {
+    const portalTotal = portalCourseTotalProgress();
+    if (portalTotal !== null) return portalTotal;
+    const totalLabel = [...document.querySelectorAll('body *')]
+      .filter(el => visible(el) && el.children.length === 0 && /总进度/.test(textOf(el)))
+      .map(el => {
+        const own = textOf(el).match(/总进度\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/);
+        const nearby = textOf(el.parentElement).match(/总进度\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/);
+        return own || nearby;
+      })
+      .find(Boolean);
+    if (totalLabel) return Number(totalLabel[1]);
+    const standalone = [...document.querySelectorAll('[role="progressbar"],progress')]
+      .filter(el => visible(el) && /总进度/.test(textOf(el.parentElement)));
+    if (standalone.length) return findProgress(standalone[0].parentElement);
+    return null;
+  }
+
+  function isSysWorkerDetailPage(context) {
+    if (isCourseDetailPage()) return true;
+    if (location.pathname.replace(/\/$/, '') !== '/sys' || isSysChannelMorePage() || isVideoPage()) return false;
+    const currentRoute = location.hash.split('?')[0];
+    const found = workerQueueItem(context);
+    if (!found) return false;
+    let assignedRoute = '';
+    try { assignedRoute = new URL(found.item.url, location.origin).hash.split('?')[0]; } catch { /* 忽略 */ }
+    return currentRoute === assignedRoute || /detail|course|audio|book|video|content/i.test(currentRoute);
+  }
+
+  function markSysLessonComplete(context) {
+    if (!context?.currentLesson) return;
+    const finished = new Set(context.finishedLessons || []);
+    finished.add(context.currentLesson);
+    saveSysWorkerContext({ ...context, finishedLessons: [...finished], currentLesson: '' });
+  }
+
+  function startSysLesson(context, lesson, retry = false) {
+    const previousAttempts = context.currentLesson === lesson.title ? Number(context.lessonClickAttempts || 0) : 0;
+    const attempts = previousAttempts + 1;
+    const nextContext = {
+      ...context, currentLesson: lesson.title,
+      currentLessonStartedAt: Date.now(), lessonClickAttempts: attempts,
+    };
+    saveSysWorkerContext(nextContext);
+    const playLink = [...lesson.row.querySelectorAll('a[href]')]
+      .find(anchor => visible(anchor) && /#\/play\//.test(anchor.href));
+    if (playLink) {
+      const target = addSysWorkerFlags(playLink.href, context.queueId, context.workerId, context.itemIndex);
+      location.assign(target);
+      return;
+    }
+    const controls = [...lesson.row.querySelectorAll('a,button,[role="button"]')].filter(visible);
+    const action = controls.find(el => /播放|继续学习|开始学习/.test(textOf(el))
+      || /play|video|study/i.test(`${el.className || ''} ${el.getAttribute('aria-label') || ''}`))
+      || controls[retry ? controls.length - 1 : 0];
+    if (retry) lesson.row.click();
+    else if (action) action.click();
+    else lesson.row.click();
+  }
+
+  function finishSysItem(context, itemIndex) {
+    const found = workerQueueItem(context);
+    if (!found) return false;
+    const { queue, item } = found;
+    if (queue.mode === 'single') {
+      const nextIndex = itemIndex + 1;
+      queue.completedItems = [...new Set([...(queue.completedItems || []), item.url])];
+      if (nextIndex >= queue.items.length) {
+        saveSysQueue({ ...queue, active: false, completed: true, index: nextIndex, completedAt: Date.now() });
+        try { sessionStorage.removeItem(SYS_WORKER_SESSION_KEY); } catch { /* 忽略 */ }
+        return true;
+      }
+      saveSysQueue({ ...queue, index: nextIndex });
+      saveSysWorkerContext({
+        ...context, itemIndex: nextIndex, currentLesson: '', finishedLessons: [],
+        doneSentIndex: null, lessonClickAttempts: 0, currentLessonStartedAt: 0,
+      });
+      location.assign(addSysWorkerFlags(queue.items[nextIndex].url, queue.id, 'single', nextIndex));
+      return true;
+    }
+    if (context.doneSentIndex === itemIndex) return true;
+    saveSysWorkerContext({ ...context, doneSentIndex: itemIndex });
+    const key = sysWorkerStateKey(queue.id, context.workerId);
+    if (typeof GM_setValue === 'function') GM_setValue(key, {
+      queueId: queue.id, workerId: context.workerId, itemIndex,
+      itemUrl: item.url, status: 'done', completedAt: Date.now(),
+    });
+    setTimeout(() => { try { window.close(); } catch { /* manager normally closes this tab */ } }, 15000);
+    return true;
+  }
+
+  function processSysWorkerDetail(context, status, actions) {
+    const found = workerQueueItem(context);
+    if (!found) { status.textContent = '该后台课程任务已失效，等待关闭。'; return; }
+    const { queue, item, itemIndex } = found;
+    const progress = readCurrentCourseProgress();
+    if (progress === 100) {
+      status.textContent = `“${item.title}”课程总进度为 100%，任务完成，正在关闭此后台并领取下一门…`;
+      finishSysItem(context, itemIndex);
+      return;
+    }
+    const finished = new Set(context.finishedLessons || []);
+    const lessons = portalCourseLessons().map(lesson => ({
+      ...lesson,
+      complete: lesson.progress === null ? (lesson.checked || finished.has(lesson.title)) : lesson.progress >= 100,
+    }));
+    context = { ...context, multiLesson: lessons.length > 1 };
+    saveSysWorkerContext(context);
+    const nextLesson = lessons.find(lesson => !lesson.complete);
+    if (lessons.length) {
+      const completed = lessons.filter(lesson => lesson.complete).length;
+      status.textContent = `后台课程“${item.title}”：${completed}/${lessons.length} 个课时完成；总进度 ${progress === null ? '未识别' : `${progress}%`}${nextLesson ? `；继续${nextLesson.title}` : ''}。`;
+      if (!nextLesson) {
+        status.textContent = `“${item.title}”目录共 ${lessons.length} 个课时，均显示完成；课程总进度为 ${progress === null ? '未识别' : `${progress}%`}。必须确认总进度100%才会进入下一门，正在等待平台更新。`;
+      }
+      if (nextLesson && context.currentLesson === nextLesson.title) {
+        const clickAttempts = Number(context.lessonClickAttempts || 0);
+        const waitingFor = Date.now() - Number(context.currentLessonStartedAt || Date.now());
+        if (waitingFor >= 6000 && clickAttempts < 3) {
+          status.textContent = `课时“${nextLesson.title}”点击后没有打开播放器，正在重新尝试（${clickAttempts + 1}/3）…`;
+          startSysLesson(context, nextLesson, true);
+        } else if (clickAttempts >= 3 && waitingFor >= 6000) {
+          status.textContent = `课时“${nextLesson.title}”尝试启动${clickAttempts}次仍未打开播放器；任务保留在本课程，不会跳过。`;
+          addButton(actions, `重试播放${nextLesson.title}`, () => startSysLesson({ ...context, lessonClickAttempts: 0 }, nextLesson, true));
+        } else {
+          status.textContent = `后台课程“${item.title}”：正在加载课时“${nextLesson.title}”，等待播放器打开（${Math.max(0, 6 - Math.floor(waitingFor / 1000))} 秒后重试）。`;
+        }
+      } else if (nextLesson) startSysLesson(context, nextLesson);
+      return;
+    }
+    const start = document.querySelector('button.to-learn')
+      || findAction('继续学习') || findAction('我要学习') || findAction('开始学习') || findAction('播放');
+    if (start && visible(start) && context.lastStartKey !== `${location.href}:${textOf(start)}`) {
+      status.textContent = `后台单视频课程“${item.title}”：总进度 ${progress === null ? '未识别' : `${progress}%`}；正在启动。`;
+      saveSysWorkerContext({ ...context, lastStartKey: `${location.href}:${textOf(start)}` });
+      autoClickOnce(start);
+    } else {
+      status.textContent = `后台课程“${item.title}”：总进度 ${progress === null ? '未识别' : `${progress}%`}；等待课程进度更新。`;
+      if (start && visible(start)) addButton(actions, '继续播放课程', () => start.click());
+    }
+  }
+
+  function startSysQueue(items, mode) {
+    if (!items.length || typeof GM_setValue !== 'function') return false;
+    const queue = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      active: true, mode, items, index: 0, nextIndex: 0,
+      assignments: {}, startedAt: Date.now(), completedItems: [],
+    };
+    if (mode === 'single') {
+      saveSysQueue(queue);
+      saveSysWorkerContext({ queueId: queue.id, workerId: 'single', itemIndex: 0, finishedLessons: [] });
+      location.href = addSysWorkerFlags(items[0].url, queue.id, 'single', 0);
+      return true;
+    }
+    const workerCount = Math.min(4, items.length);
+    for (let i = 0; i < workerCount; i++) queue.assignments[`worker-${i + 1}`] = { itemIndex: i, status: 'working' };
+    queue.nextIndex = workerCount;
+    saveSysQueue(queue);
+    for (let i = 0; i < workerCount; i++) openSysWorker(queue, `worker-${i + 1}`, i);
+    return true;
+  }
+
+  function openSysWorker(queue, workerId, itemIndex) {
+    const key = sysWorkerStateKey(queue.id, workerId);
+    listenSysWorker(queue.id, workerId);
+    if (typeof GM_setValue === 'function') GM_setValue(key, {
+      queueId: queue.id, workerId, itemIndex, itemUrl: queue.items[itemIndex].url,
+      status: 'working', startedAt: Date.now(),
+    });
+    const target = addSysWorkerFlags(queue.items[itemIndex].url, queue.id, workerId, itemIndex);
+    try {
+      const tab = typeof GM_openInTab === 'function'
+        ? GM_openInTab(target, { active: false, insert: true, setParent: true })
+        : window.open(target, '_blank');
+      if (tab) sysWorkerTabs.set(workerId, tab);
+    } catch { /* manager会显示未能打开的工作标签 */ }
+  }
+
+  function handleSysWorkerDone(queueId, workerId, value) {
+    const queue = sysQueue();
+    if (!queue?.active || queue.id !== queueId) return;
+    const assignment = queue.assignments?.[workerId];
+    if (!assignment || assignment.itemIndex !== value.itemIndex || assignment.status !== 'working') return;
+    queue.completedItems = [...new Set([...(queue.completedItems || []), value.itemUrl])];
+    try { sysWorkerTabs.get(workerId)?.close?.(); } catch { /* 忽略 */ }
+    sysWorkerTabs.delete(workerId);
+    if (queue.nextIndex < queue.items.length) {
+      const nextIndex = queue.nextIndex;
+      queue.assignments[workerId] = { itemIndex: nextIndex, status: 'working' };
+      queue.nextIndex++;
+      saveSysQueue(queue);
+      openSysWorker(queue, workerId, nextIndex);
+      return;
+    }
+    queue.assignments[workerId] = { ...assignment, status: 'done' };
+    const allDone = Object.values(queue.assignments).every(worker => worker.status === 'done');
+    if (allDone) { queue.active = false; queue.completed = true; queue.completedAt = Date.now(); }
+    saveSysQueue(queue);
   }
 
   function isWorkshopDetailPage() {
@@ -663,6 +1101,78 @@
   function findAction(label) {
     return [...document.querySelectorAll('a,button,[role="button"],.edit-block')]
       .find(el => visible(el) && textOf(el).includes(label));
+  }
+
+  function nativeAutoplayState() {
+    const labels = [...document.querySelectorAll('label,button,[role="switch"],[aria-label],span,div')]
+      .filter(el => visible(el) && /自动播放/.test(textOf(el) || el.getAttribute('aria-label') || '')
+        && textOf(el).length < 50 && !el.closest('#ccb-helper-panel'))
+      .sort((a, b) => textOf(a).length - textOf(b).length);
+    for (const label of labels) {
+      let scope = label;
+      for (let depth = 0; depth < 4 && scope; depth++, scope = scope.parentElement) {
+        const controls = [scope, ...scope.querySelectorAll('input[type="checkbox"],[role="switch"],[aria-checked],button,[class*="switch" i]')]
+          .filter(control => visible(control));
+        for (const control of controls) {
+          const checked = control.matches('input[type="checkbox"]') ? control.checked : null;
+          const aria = control.getAttribute('aria-checked');
+          const classes = String(control.className?.baseVal || control.className || '').toLowerCase();
+          const state = checked !== null ? checked
+            : aria === 'true' ? true : aria === 'false' ? false
+              : /(?:is-checked|checked|switch-on|active|enabled)/.test(classes) ? true
+                : /(?:is-unchecked|unchecked|switch-off|disabled)/.test(classes) ? false : null;
+          if (state !== null && (/自动播放/.test(textOf(scope) || scope.getAttribute?.('aria-label') || '')
+            || /(?:switch|toggle|checkbox)/i.test(`${control.tagName} ${classes} ${control.getAttribute('role') || ''}`))) {
+            return { control, enabled: state };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function enableNativeAutoplay() {
+    const result = nativeAutoplayState();
+    if (!result) return { enabled: null, message: '未识别网页自动播放开关' };
+    if (result.enabled) return { enabled: true, message: '网页自动播放已开启' };
+    if (attemptedNativeAutoplay.has(result.control)) return { enabled: false, message: '等待网页自动播放开关确认开启' };
+    attemptedNativeAutoplay.add(result.control);
+    result.control.click();
+    const after = nativeAutoplayState();
+    return after?.enabled === true
+      ? { enabled: true, message: '已开启网页自动播放' }
+      : { enabled: after?.enabled ?? null, message: '已尝试开启网页自动播放，等待状态确认' };
+  }
+
+  function currentPlaybackKey() {
+    const media = visibleVideo();
+    return `${location.pathname}${location.hash}|${media?.currentSrc || media?.src || ''}`;
+  }
+
+  function formatMediaTime(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const remainder = total % 60;
+    return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+      : `${minutes}:${String(remainder).padStart(2, '0')}`;
+  }
+
+  function rewindCompletedLessonTwoSeconds(media, progress) {
+    if (!media || progress !== 100 || !Number.isFinite(media.duration) || media.duration <= 0) return false;
+    const key = currentPlaybackKey();
+    if (lastRewoundPlaybackKey === key) return false;
+    try {
+      const targetTime = Math.max(0, media.duration - 2);
+      if (media.duration <= 2) return false;
+      media.currentTime = targetTime;
+      lastRewoundPlaybackKey = key;
+      if (media.paused || media.ended) {
+        const attempt = media.play();
+        attempt?.catch?.(() => { /* 页面自动播放策略可能拒绝脚本播放 */ });
+      }
+      return true;
+    } catch { return false; }
   }
 
   function autoClickOnce(el) {
@@ -839,13 +1349,14 @@
     }
   }
 
-  function safePlayVideo(progress) {
-    const video = [...document.querySelectorAll('video')].find(visible);
+  function safePlayVideo(progress, allowPausedRecovery = true) {
+    const video = [...document.querySelectorAll('video,audio')].find(visible);
     if (!video) return '尚未检测到 HTML 视频播放器';
     video.muted = !!settings.muted;
     applyPlaybackRate(video);
     if (!video.paused && (progress === null || progress < 100)) claimActiveWorkshop(false);
-    if (settings.autoplay && (progress === null || progress < 100)) {
+    const initialStart = video.paused && video.currentTime < 1 && video.played.length === 0;
+    if (settings.autoplay && (progress === null || progress < 100) && (allowPausedRecovery || initialStart)) {
       keepVideoPlaying(video);
     }
     const rateNote = Math.abs(video.playbackRate - 1) > 1e-6 ? `，${video.playbackRate}倍速` : '';
@@ -1012,22 +1523,23 @@
   function setRunning(next) {
     isRunning = !!next;
     const toggle = panel.querySelector('[data-act="run-toggle"]');
-    const pausedQueue = !isRunning && !!activePortalQueue();
+    const pausedQueue = !isRunning && (!!activePortalQueue() || !!sysQueue()?.active);
     toggle.textContent = isRunning ? '停止执行' : pausedQueue ? '选择恢复方式' : '继续执行';
     toggle.title = isRunning ? '停止所有脚本标签页的自动处理'
       : pausedQueue ? '选择继续上次课程任务或重新选择课程' : '继续所有脚本标签页的自动处理';
     if (!isRunning) {
+      multiLessonPauseProbe = { key: '', since: 0 };
       releaseScreenWakeLock();
       const queue = activePortalQueue();
       if (queue?.stalledSince) savePortalQueue({ ...queue, stalledSince: 0 });
-      for (const video of document.querySelectorAll('video')) video.pause();
+      for (const video of document.querySelectorAll('video,audio')) video.pause();
     } else {
       requestScreenWakeLock();
     }
     update();
   }
   panel.querySelector('[data-act="run-toggle"]').addEventListener('click', () => {
-    if (!isRunning && activePortalQueue()) { update(); return; }
+    if (!isRunning && (activePortalQueue() || sysQueue()?.active)) { update(); return; }
     const next = !isRunning;
     if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, next);
     setRunning(next);
@@ -1045,6 +1557,7 @@
     actions.replaceChildren();
     if (!isRunning) {
       const queue = activePortalQueue();
+      const sysPaused = sysQueue();
       const toggle = panel.querySelector('[data-act="run-toggle"]');
       if (queue) {
         status.textContent = `课程任务已暂停，当前为第 ${queue.index + 1}/${queue.items.length} 门：${queue.items[queue.index]?.title || '课程'}。请选择如何继续。`;
@@ -1063,10 +1576,23 @@
           setRunning(true);
           location.assign('https://u.ccb.com/portal/#/study?microPageId=1565348618942312449');
         });
+      } else if (sysPaused?.active) {
+        const channelName = sysPaused.items?.[0]?.section || '频道课程';
+        status.textContent = `${channelName}任务已停止：已完成 ${sysPaused.completedItems?.length || 0}/${sysPaused.items?.length || 0} 门。可继续上次选中的队列，或重新扫描该频道的未完成课程。`;
+        toggle.textContent = '选择继续方式';
+        toggle.title = '选择继续上次选择课程任务，或重新检测未完成课程并开启新一轮';
+        addButton(actions, '继续上次选择课程任务', resumeSysQueue);
+        addButton(actions, '重新检测未完成课程并开启新一轮', () => restartSysQueue(sysPaused));
       } else {
         status.textContent = '脚本已停止；点击“继续执行”恢复。';
         toggle.textContent = '继续执行';
       }
+      return;
+    }
+    const priorSysContext = sysWorkerContext();
+    if (priorSysContext?.queueId && !workerQueueItem(priorSysContext)) {
+      status.textContent = '此后台课程任务已停止或已重新分配，正在关闭旧工作标签。';
+      setTimeout(() => { try { window.close(); } catch { /* 仅关闭脚本创建的后台标签 */ } }, 300);
       return;
     }
     if (isClassListPage()) {
@@ -1083,33 +1609,74 @@
     }
     if (isVideoPage()) {
       const p = findProgress();
-      const playResult = safePlayVideo(p);
-      status.textContent = `视频页面：${p === null ? '未识别到进度' : `页面进度 ${p}%`}；${playResult}`;
+      const sysContext = sysWorkerContext();
+      const sysFound = workerQueueItem(sysContext);
+      const portalQueue = portalQueueForCurrentVideo();
+      const multiLesson = !!(sysFound && sysContext.multiLesson || portalQueue?.multiLesson);
+      const nativeAutoplay = multiLesson ? enableNativeAutoplay() : null;
+      const media = visibleVideo();
+      const rewoundToEndBuffer = multiLesson && rewindCompletedLessonTwoSeconds(media, p);
+      const playResult = safePlayVideo(p, !multiLesson);
+      if (multiLesson && p !== 100 && media && settings.autoplay) keepVideoPlaying(media);
+      status.textContent = `视频页面：${p === null ? '未识别到进度' : `页面进度 ${p}%`}；${playResult}${nativeAutoplay ? `；${nativeAutoplay.message}` : ''}${rewoundToEndBuffer ? `；已定位到课时结束前2秒（${formatMediaTime(media.duration - 2)}），等待网页自动切换下一课时` : ''}`;
+      if (multiLesson) {
+        if (media?.paused) {
+          const key = currentPlaybackKey();
+          if (multiLessonPauseProbe.key !== key) multiLessonPauseProbe = { key, since: Date.now() };
+          const pausedFor = Date.now() - multiLessonPauseProbe.since;
+          if (pausedFor >= 30000) {
+            if (sysFound) {
+              if (p === 100) markSysLessonComplete(sysContext);
+              else saveSysWorkerContext({ ...sysContext, currentLesson: '' });
+            } else if (portalQueue) {
+              if (p === 100) markPortalLessonComplete(portalQueue);
+              else savePortalQueue({ ...portalQueue, currentLesson: '' });
+            }
+            const target = sysFound
+              ? addSysWorkerFlags(sysFound.item.url, sysFound.queue.id, sysContext.workerId, sysFound.itemIndex)
+              : courseDetailReturnUrl() || portalQueue?.items?.[portalQueue.index]?.url;
+            status.textContent = `同一课时在播放页暂停超过30秒（当前进度 ${p === null ? '未识别' : `${p}%`}）；返回课程详情核对总进度和剩余课时。`;
+            multiLessonPauseProbe = { key: '', since: 0 };
+            if (target) autoNavigateOnce(`multi-course-paused:${key}`, target);
+          } else {
+            status.textContent = `网页自动播放已开启；当前课时未切换且播放器已暂停，等待30秒确认（${Math.ceil((30000 - pausedFor) / 1000)} 秒）。`;
+          }
+          return;
+        }
+        multiLessonPauseProbe = { key: '', since: 0 };
+        status.textContent = `多课时课程留在播放页，由网页自动播放切换课时；${nativeAutoplay?.message || '正在监测播放器状态'}。`;
+        return;
+      }
       if (p === 100) {
-        const queue = activePortalQueue();
-        if (queue) {
-          markPortalLessonComplete(queue);
-          const target = courseDetailReturnUrl() || queue.items[queue.index]?.url;
+        if (sysFound) {
+          markSysLessonComplete(sysContext);
+          const target = addSysWorkerFlags(sysFound.item.url, sysFound.queue.id, sysContext.workerId, sysFound.itemIndex);
+          status.textContent = '当前视频完成，返回本后台对应课程目录核对剩余课时…';
+          autoNavigateOnce(`sys-course:${sysFound.queue.id}:${sysFound.itemIndex}:${location.hash}`, target);
+        } else if (portalQueue) {
+          markPortalLessonComplete(portalQueue);
+          const target = courseDetailReturnUrl() || portalQueue.items[portalQueue.index]?.url;
           status.textContent = '当前课时已完成，正在返回课程目录核对并开始下一课时…';
-          if (target) autoNavigateOnce(`portal-course:${queue.index}:${location.hash}`, target);
+          if (target) autoNavigateOnce(`portal-course:${portalQueue.index}:${location.hash}`, target);
+        } else if (hasWorkshopTaskReturn()) {
+          status.textContent = '当前视频已完成，正在返回“我的专题班”重新检索未完成课程…';
+          returnToWorkshopListAfterDelay();
         } else {
-          status.textContent += '。该视频显示已完成，可返回专题班详情核对其余课程。';
-          addButton(actions, '返回详情', () => {
-            const back = document.querySelector('.player_area .return-btn');
-            if (back) back.click(); else history.back();
-          });
-          if (settings.autoOpen) {
-            const target = workshopDetailUrl();
-            if (target) autoNavigateOnce(location.hash, target);
+          const target = courseDetailReturnUrl();
+          if (target) {
+            status.textContent = '当前视频已完成，正在返回上一级课程详情检查未完成课时…';
+            autoNavigateOnce(`course-detail:${location.hash}`, target);
+          } else {
+            status.textContent += '。该视频已完成；返回上一级检查课程进度。';
+            addButton(actions, '返回上一级检查课程', () => history.back());
           }
         }
-      } else if (activePortalQueue()) {
-        const queue = activePortalQueue();
-        const stalledFor = portalStallDuration(queue);
+      } else if (portalQueue) {
+        const stalledFor = portalStallDuration(portalQueue);
         if (stalledFor >= 15000) {
-          if (queue.multiLesson) {
-            const target = courseDetailReturnUrl() || queue.items[queue.index]?.url;
-            savePortalQueue({ ...queue, stalledSince: 0 });
+          if (portalQueue.multiLesson) {
+            const target = courseDetailReturnUrl() || portalQueue.items[portalQueue.index]?.url;
+            savePortalQueue({ ...portalQueue, stalledSince: 0 });
             status.textContent = '多课时课程的视频 15 秒未播放，返回目录重新核对当前课时；不会跳过整门课程。';
             if (target) location.assign(target);
           } else {
@@ -1120,6 +1687,80 @@
         }
       } else if (settings.autoplay) {
         status.textContent += '；进度未满 100%，已保持自动播放。';
+      }
+      return;
+    }
+    const sysContext = sysWorkerContext();
+    const sysFound = workerQueueItem(sysContext);
+    if (sysFound && isSysWorkerDetailPage(sysContext)) {
+      processSysWorkerDetail(sysContext, status, actions);
+      return;
+    }
+    if (isSysChannelMorePage()) {
+      const queue = sysQueue();
+      if (queue?.active && queue.mode === 'parallel') {
+        for (const [workerId, assignment] of Object.entries(queue.assignments || {})) {
+          if (assignment.status === 'working') listenSysWorker(queue.id, workerId);
+        }
+        const running = Object.values(queue.assignments || {}).filter(worker => worker.status === 'working').length;
+        status.textContent = `四窗口任务进行中：已完成 ${queue.completedItems?.length || 0}/${queue.items.length} 门；当前 ${running} 个后台课程标签，待领取 ${Math.max(0, queue.items.length - queue.nextIndex)} 门。`;
+        addButton(actions, '停止执行', () => {
+          if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, false);
+          setRunning(false);
+        });
+        return;
+      }
+      const scan = scanSysChannelPages();
+      const { mid, name } = sysChannelInfo();
+      const selectionKey = `${SYS_SELECTION_PREFIX}${mid}`;
+      const selected = new Set(typeof GM_getValue === 'function' ? GM_getValue(selectionKey, []) : []);
+      const available = scan.courses.filter(course => !portalCourseIsComplete(course));
+      status.textContent = scan.state === 'scanning'
+        ? `正在扫描“${name}”：已检查 ${scan.pages} 页，读取到 ${scan.courses.length} 门课程…`
+        : `“${name}”扫描完成：共检查 ${scan.pages} 页，读取到 ${scan.courses.length} 门课程；勾选后选择执行方式。`;
+      if (scan.state === 'scanning') return;
+      const restart = typeof GM_getValue === 'function' ? GM_getValue(SYS_RESTART_KEY, null) : null;
+      if (restart?.mid === mid) {
+        GM_setValue(SYS_RESTART_KEY, null);
+        GM_setValue(selectionKey, available.map(course => course.url));
+        if (!available.length) {
+          status.textContent = `重新检测完成：“${name}”频道当前没有未完成课程。`;
+        } else {
+          status.textContent = `重新检测到 ${available.length} 门未完成课程，按上次的${restart.mode === 'single' ? '单窗口' : '四窗口'}模式开始新一轮。`;
+          startSysQueue(available, restart.mode === 'single' ? 'single' : 'parallel');
+        }
+        return;
+      }
+      for (const course of scan.courses) {
+        const row = document.createElement('label'); row.className = 'course';
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox';
+        const completed = portalCourseIsComplete(course);
+        checkbox.checked = selected.has(course.url) && !completed;
+        checkbox.disabled = completed;
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked) selected.add(course.url); else selected.delete(course.url);
+          GM_setValue(selectionKey, [...selected]);
+        });
+        const title = document.createElement('span');
+        title.textContent = `${course.title} · ${completed ? '已完成' : course.progress === null ? '进度未识别' : `总进度 ${course.progress}%`}`;
+        row.append(checkbox, title); actions.append(row);
+      }
+      const selectAll = document.createElement('button'); selectAll.textContent = '全选未完成课程';
+      selectAll.addEventListener('click', () => {
+        for (const course of available) selected.add(course.url);
+        GM_setValue(selectionKey, [...selected]); update();
+      });
+      const clearSelection = document.createElement('button'); clearSelection.textContent = '清空选择';
+      clearSelection.addEventListener('click', () => { GM_setValue(selectionKey, []); update(); });
+      actions.prepend(selectAll, clearSelection);
+      const chosen = scan.courses.filter(course => selected.has(course.url) && !portalCourseIsComplete(course));
+      for (const [label, mode] of [['开始单个执行选中视频', 'single'], ['开始4个窗口分别执行选中视频', 'parallel']]) {
+        const button = document.createElement('button'); button.textContent = label; button.disabled = chosen.length === 0;
+        button.addEventListener('click', () => {
+          if (!startSysQueue(chosen, mode)) status.textContent = '无法创建课程队列，请确认脚本管理器已启用 GM 存储权限。';
+          else if (mode === 'parallel') update();
+        });
+        actions.append(button);
       }
       return;
     }
@@ -1177,6 +1818,7 @@
           status.textContent = '勾选的课程均已完成或总进度显示 100%，没有需要处理的课程。';
           return;
         }
+        try { sessionStorage.removeItem(WORKSHOP_RETURN_KEY); } catch { /* 忽略 */ }
         savePortalQueue({ active: true, items, index: 0, startedAt: Date.now() });
         if (typeof GM_setValue === 'function') GM_setValue(RUN_KEY, true);
         setRunning(true);
@@ -1299,6 +1941,16 @@
           queue = { ...queue, multiLesson: false, stalledSince: 0 };
           savePortalQueue(queue);
         }
+      if (rawLessons.length && portalCourseTotalProgress() === 100) {
+        const next = advancePortalQueue(queue);
+        if (next) {
+          status.textContent = `课程“${item.title}”总进度已达100%；正在进入下一门“${next.title}”。`;
+          location.href = next.url;
+        } else {
+          status.textContent = `课程“${item.title}”总进度已达100%；已选课程全部完成。`;
+        }
+        return;
+      }
         const lessons = rawLessons.map(lesson => ({
           ...lesson,
           complete: lesson.checked || finished.has(lesson.title),
@@ -1329,10 +1981,17 @@
           }
           return;
         }
-        const allDone = lessons.length > 0 && lessons.every(lesson => lesson.checked);
+        const allLessonRowsComplete = lessons.length > 0 && lessons.every(lesson => lesson.complete);
+        const totalProgress = portalCourseTotalProgress();
+        const allDone = allLessonRowsComplete && totalProgress === 100;
         const nextLesson = lessons.find(lesson => !lesson.locked && !lesson.complete);
-        const checkedCount = lessons.filter(lesson => lesson.checked).length;
+        const checkedCount = lessons.filter(lesson => lesson.complete).length;
         status.textContent = `课程“${item.title}”：目录识别到 ${lessons.length} 个课时，${checkedCount} 个已确认完成${nextLesson ? `；准备学习${nextLesson.title}` : ''}。`;
+        if (allLessonRowsComplete && totalProgress !== 100) {
+          portalCourseDoneSince = 0;
+          status.textContent = `课程“${item.title}”的 ${lessons.length} 个课时均显示完成，但总进度为 ${totalProgress === null ? '未识别' : `${totalProgress}%`}；只有总进度达到100%才切换课程，正在等待平台更新。`;
+          return;
+        }
         if (allDone) {
           if (!portalCourseDoneSince) portalCourseDoneSince = Date.now();
           const remain = Math.max(0, 5000 - (Date.now() - portalCourseDoneSince));
